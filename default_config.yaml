@@ -1,0 +1,9 @@
+model: "faster-whisper/large-v3"
+language: "ru"
+device: "cuda"
+compute_type: "float16"
+batch_size: 128
+audio_extensions: [".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus"]
+align: false
+output_format: "txt"
+save_segments: false

@@ -3,3 +3,5 @@ whisperx
 transformers
 faster-whisper
 ctranslate2
+pyyaml
+requests
