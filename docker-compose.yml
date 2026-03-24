@@ -1,0 +1,11 @@
+version: '3.8'
+services:
+  whisperx:
+    build: .
+    volumes:
+      - /путь/к/аудио:/input
+      - /путь/к/текстам:/output
+      - whisperx-cache:/root/.cache/huggingface  # кэш моделей
+    command: /input /output --model medium --language ru
+volumes:
+  whisperx-cache:
