@@ -225,12 +225,14 @@ def process_batch():
         answers_data = {}
         if answers_json_path.exists():
             try:
+                # Читаем только если нужно, и эффективно.
+                # С 450к записями это может занять память, поэтому выводим лог.
+                logger.info(f"Loading metadata from {answers_json_path}...")
                 with open(answers_json_path, "r", encoding="utf-8") as af:
                     answers_list = json.load(af)
-                    # Индексируем по file_name или как-то еще.
-                    # Но в оригинале answers_full.json может иметь разную структуру.
-                    # Предположим, это список объектов с file_name или мы сопоставляем по ID.
                     if isinstance(answers_list, list):
+                        logger.info(f"Loaded {len(answers_list)} metadata records")
+                        # Индексируем по имени файла для быстрого поиска
                         for item in answers_list:
                             fname = item.get("file_name")
                             if fname:
