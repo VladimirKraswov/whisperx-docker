@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -60,62 +61,6 @@ def extract_user_id(filename: str) -> int:
         return int(parts[0])
     return 0
 
-def load_answers_index(answers_path: Path, base_dir: Path) -> dict:
-    """
-    Загружает answers_full.json и строит индекс для быстрого поиска.
-    Ключи:
-      - полный путь (resolve)
-      - имя файла (если нет полного пути)
-    """
-    if not answers_path.exists():
-        logger.warning(f"Answers JSON not found at {answers_path}")
-        return {}
-    try:
-        with open(answers_path, "r", encoding="utf-8") as f:
-            records = json.load(f)
-        logger.info(f"Loaded {len(records)} records from {answers_path}")
-        index = {}
-        for rec in records:
-            fpath = rec.get("file_name")
-            if not fpath:
-                continue
-            # Попробуем получить абсолютный путь
-            p = Path(fpath)
-            if not p.is_absolute():
-                # Если путь относительный, пробуем сделать его абсолютным относительно base_dir
-                p = (base_dir / p).resolve()
-            else:
-                p = p.resolve()
-            # Сохраняем по полному пути
-            index[str(p)] = {
-                "question": rec.get("question", ""),
-                "quiz_id": rec.get("quiz_id", None)
-            }
-            # Также сохраняем по имени файла для случая, если полный путь не совпадёт
-            index[p.name] = {
-                "question": rec.get("question", ""),
-                "quiz_id": rec.get("quiz_id", None)
-            }
-        logger.info(f"Built index with {len(index)} entries (including filename keys)")
-        return index
-    except Exception as e:
-        logger.warning(f"Could not read answers JSON: {e}")
-        return {}
-
-def get_metadata(file_path: Path, index: dict) -> tuple:
-    """
-    Возвращает (question, quiz_id) для файла, пытаясь найти по полному пути,
-    затем по имени файла.
-    """
-    abs_path = str(file_path.resolve())
-    if abs_path in index:
-        rec = index[abs_path]
-        return rec["question"], rec["quiz_id"]
-    if file_path.name in index:
-        rec = index[file_path.name]
-        return rec["question"], rec["quiz_id"]
-    return "", None
-
 def process_batch():
     parser = build_parser()
     args = parser.parse_args()
@@ -134,25 +79,49 @@ def process_batch():
         logger.error(f"Docker image {DEFAULT_IMAGE} not found. Please build it first.")
         sys.exit(1)
 
-    # 1. Поиск файлов по размеру
+    # 1. Загружаем индекс answers_full.json по полному пути
+    answers_index = {}
+    if answers_json_path.exists():
+        try:
+            with open(answers_json_path, "r", encoding="utf-8") as f:
+                answers_list = json.load(f)
+            logger.info(f"Loaded {len(answers_list)} records from {answers_json_path}")
+            for item in answers_list:
+                fpath = item.get("file_name")
+                if fpath:
+                    resolved = Path(fpath).resolve()
+                    answers_index[resolved] = {
+                        "question": item.get("question", ""),
+                        "quiz_id": item.get("quiz_id", None)
+                    }
+            logger.info(f"Indexed {len(answers_index)} unique file paths.")
+        except Exception as e:
+            logger.error(f"Failed to load answers JSON: {e}")
+            sys.exit(1)
+    else:
+        logger.error(f"Answers JSON not found at {answers_json_path}. Cannot proceed.")
+        sys.exit(1)
+
+    # 2. Ищем файлы, присутствующие в индексе, и фильтруем по размеру
     audio_extensions = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus"}
     found_files = []
     for item in sorted(input_dir.iterdir()):
-        if item.is_file() and item.suffix.lower() in audio_extensions:
-            size_kb = item.stat().st_size / 1024
-            if size_kb >= args.min_size:
-                found_files.append(item)
-                if len(found_files) >= args.max_files:
-                    break
+        if not item.is_file() or item.suffix.lower() not in audio_extensions:
+            continue
+        resolved = item.resolve()
+        if resolved not in answers_index:
+            continue
+        size_kb = item.stat().st_size / 1024
+        if size_kb >= args.min_size:
+            found_files.append(item)
+            if len(found_files) >= args.max_files:
+                break
 
     if not found_files:
-        logger.info(f"No suitable audio files found in {input_dir} (min size {args.min_size} KB)")
+        logger.info(f"No suitable audio files found in {input_dir} (must be in answers JSON, min size {args.min_size} KB)")
         return
 
-    logger.info(f"Found {len(found_files)} files for processing")
-
-    # 2. Загрузка индекса метаданных
-    answers_index = load_answers_index(answers_json_path, input_dir)
+    logger.info(f"Found {len(found_files)} files for processing (out of {len(answers_index)} in answers JSON)")
 
     # 3. Создание временных папок
     temp_input_dir = tempfile.mkdtemp(prefix="whisperx_in_")
@@ -175,7 +144,10 @@ def process_batch():
         elif args.device == "auto":
             use_gpu = is_nvidia_gpu_available()
 
-        docker_cmd = ["docker", "run", "--rm"]
+        docker_cmd = [
+            "docker", "run", "--rm"
+        ]
+
         if use_gpu:
             docker_cmd.extend(["--gpus", "all"])
             logger.info("Using GPU for Docker container")
@@ -212,10 +184,11 @@ def process_batch():
 
         if process.returncode != 0:
             logger.error(f"Docker container exited with error code {process.returncode}")
+            # Продолжаем, чтобы собрать хотя бы частичные результаты
         else:
             logger.info("Docker transcription completed successfully")
 
-        # 6. Сбор результатов
+        # 6. Сбор результатов и объединение с метаданными
         final_records = []
         for txt_file in Path(temp_output_dir).glob("*.txt"):
             audio_name = txt_file.stem
@@ -228,7 +201,10 @@ def process_batch():
             with open(txt_file, "r", encoding="utf-8") as f:
                 answer_text = f.read().strip()
 
-            question, quiz_id = get_metadata(orig_file, answers_index)
+            # Получаем метаданные из индекса
+            meta = answers_index.get(orig_file.resolve(), {})
+            question = meta.get("question", "")
+            quiz_id = meta.get("quiz_id", None)
 
             final_records.append({
                 "user_id": extract_user_id(orig_file.name),
