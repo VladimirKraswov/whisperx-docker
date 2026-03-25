@@ -1,17 +1,33 @@
 import argparse
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
 import requests
-import torch
-import whisperx
+try:
+    import torch
+    import whisperx
+except ImportError:
+    torch = None
+    whisperx = None
 import yaml
 
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    stream=sys.stdout
+)
+logger = logging.getLogger("whisperx-docker")
 
 DEFAULT_CONFIG_PATH = Path("/app/default_config.yaml")
+MOUNTED_CONFIG_PATH = Path("/config/config.yaml")
+DEFAULT_INPUT_DIR = "/input"
+DEFAULT_OUTPUT_DIR = "/output"
 DEFAULT_AUDIO_EXTENSIONS = [".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus"]
 
 
@@ -46,9 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("input_dir_pos", nargs="?", help="Input directory (positional compatibility mode)")
     parser.add_argument("output_dir_pos", nargs="?", help="Output directory (positional compatibility mode)")
 
-    parser.add_argument("--config", help="Path or URL to YAML config")
-    parser.add_argument("--input_dir", help="Directory with audio files")
-    parser.add_argument("--output_dir", help="Directory to save outputs")
+    parser.add_argument("--config", help=f"Path or URL to YAML config (default: {MOUNTED_CONFIG_PATH} if exists)")
+    parser.add_argument("--input_dir", default=DEFAULT_INPUT_DIR, help=f"Directory with audio files (default: {DEFAULT_INPUT_DIR})")
+    parser.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR, help=f"Directory to save outputs (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("--model", help="Whisper model name, e.g. large-v3")
     parser.add_argument("--language", help='Language code, e.g. "ru", "en", or "auto"')
     parser.add_argument("--device", help="cuda or cpu")
@@ -131,19 +147,33 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
     config["audio_extensions"] = [str(ext).lower() for ext in config["audio_extensions"]]
 
     if not config.get("input_dir"):
-        raise ValueError("input_dir is required")
+        config["input_dir"] = DEFAULT_INPUT_DIR
     if not config.get("output_dir"):
-        raise ValueError("output_dir is required")
+        config["output_dir"] = DEFAULT_OUTPUT_DIR
 
     if config.get("language", "").lower() == "auto":
         config["language"] = "auto"
 
-    if config.get("device") == "cuda" and not torch.cuda.is_available():
-        print("[!] CUDA requested but not available. Falling back to CPU.")
+    # Автоматический выбор девайса
+    if not config.get("device"):
+        if torch:
+            config["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            config["device"] = "cpu"
+
+    if torch and config.get("device") == "cuda" and not torch.cuda.is_available():
+        logger.warning("CUDA requested but not available. Falling back to CPU.")
         config["device"] = "cpu"
 
+    # Настройка типа вычислений в зависимости от девайса
+    if not config.get("compute_type"):
+        if torch:
+            config["compute_type"] = "float16" if config["device"] == "cuda" else "int8"
+        else:
+            config["compute_type"] = "int8"
+
     if config.get("device") == "cpu" and config.get("compute_type") in {"float16", "bfloat16"}:
-        print("[!] compute_type=float16 is not suitable for CPU. Switching to int8.")
+        logger.warning(f"compute_type={config.get('compute_type')} is not suitable for CPU. Switching to int8.")
         config["compute_type"] = "int8"
 
     if config.get("diarize") and not config.get("hf_token"):
@@ -188,8 +218,13 @@ def build_runtime_config(raw_args: list[str]) -> dict[str, Any]:
     parser = build_parser()
     args = parser.parse_args(raw_args)
 
+    config_path = args.config
+    if not config_path and MOUNTED_CONFIG_PATH.exists():
+        logger.info(f"Using mounted config file: {MOUNTED_CONFIG_PATH}")
+        config_path = str(MOUNTED_CONFIG_PATH)
+
     default_cfg = load_yaml_from_path_or_url(str(DEFAULT_CONFIG_PATH))
-    file_cfg = load_yaml_from_path_or_url(args.config)
+    file_cfg = load_yaml_from_path_or_url(config_path)
     env_cfg = load_env_overrides()
 
     cli_cfg = {
@@ -211,7 +246,7 @@ def main() -> None:
     try:
         config = build_runtime_config(sys.argv[1:])
     except Exception as exc:
-        print(f"[!] Configuration error: {exc}")
+        logger.error(f"Configuration error: {exc}")
         sys.exit(2)
 
     input_dir = Path(config["input_dir"]).expanduser().resolve()
@@ -219,16 +254,16 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if not input_dir.exists():
-        print(f"[!] Input directory does not exist: {input_dir}")
+        logger.error(f"Input directory does not exist: {input_dir}")
         sys.exit(2)
 
     audio_files = discover_audio_files(input_dir, config["audio_extensions"])
     if not audio_files:
-        print(f"[!] No audio files found in {input_dir}")
+        logger.warning(f"No audio files found in {input_dir}")
         sys.exit(0)
 
-    print("[*] Effective configuration:")
-    print(json.dumps(
+    logger.info("Effective configuration:")
+    logger.info(json.dumps(
         {
             "input_dir": str(input_dir),
             "output_dir": str(output_dir),
@@ -250,7 +285,7 @@ def main() -> None:
 
     load_language = None if config["language"] == "auto" else config["language"]
 
-    print(f"[*] Loading WhisperX model: {config['model']} on {config['device']} ({config['compute_type']})")
+    logger.info(f"Loading WhisperX model: {config['model']} on {config['device']} ({config['compute_type']})")
     model = whisperx.load_model(
         config["model"],
         config["device"],
@@ -265,7 +300,7 @@ def main() -> None:
     if config["diarize"]:
         from whisperx.diarize import DiarizationPipeline
 
-        print("[*] Initializing diarization pipeline")
+        logger.info("Initializing diarization pipeline")
         diarize_model = DiarizationPipeline(
             token=config["hf_token"],
             device=config["device"],
@@ -275,7 +310,7 @@ def main() -> None:
     failed = 0
 
     for audio_path in audio_files:
-        print(f"\n[*] Processing: {audio_path.name}")
+        logger.info(f"Processing: {audio_path.name}")
 
         try:
             audio = whisperx.load_audio(str(audio_path))
@@ -291,7 +326,7 @@ def main() -> None:
                     raise RuntimeError("Alignment requested but transcription did not return language")
 
                 if result_language not in align_cache:
-                    print(f"[*] Loading align model for language: {result_language}")
+                    logger.info(f"Loading align model for language: {result_language}")
                     align_cache[result_language] = whisperx.load_align_model(
                         language_code=result_language,
                         device=config["device"],
@@ -323,25 +358,25 @@ def main() -> None:
             if output_format == "txt":
                 output_file = output_dir / f"{base_name}.txt"
                 save_txt(output_file, result)
-                print(f"[*] Saved text: {output_file}")
+                logger.info(f"Saved text: {output_file}")
 
                 if config["save_segments"]:
                     segments_file = output_dir / f"{base_name}.segments.json"
                     save_segments_json(segments_file, result)
-                    print(f"[*] Saved segments JSON: {segments_file}")
+                    logger.info(f"Saved segments JSON: {segments_file}")
 
             elif output_format == "json":
                 output_file = output_dir / f"{base_name}.json"
                 save_json(output_file, result)
-                print(f"[*] Saved JSON: {output_file}")
+                logger.info(f"Saved JSON: {output_file}")
 
             processed += 1
 
         except Exception as exc:
             failed += 1
-            print(f"[!] Error processing {audio_path.name}: {exc}")
+            logger.error(f"Error processing {audio_path.name}: {exc}")
 
-    print(f"\n[*] Done. Processed: {processed}, failed: {failed}, total: {len(audio_files)}")
+    logger.info(f"Done. Processed: {processed}, failed: {failed}, total: {len(audio_files)}")
 
 
 if __name__ == "__main__":

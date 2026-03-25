@@ -1,7 +1,7 @@
 model: "large-v3"
 language: "ru"
-device: "cuda"
-compute_type: "float16"
+device: null # Автовыбор: cuda или cpu
+compute_type: null # Автовыбор: float16 (cuda) или int8 (cpu)
 batch_size: 16
 audio_extensions:
   - ".mp3"

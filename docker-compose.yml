@@ -1,33 +1,29 @@
 services:
-  whisperx-base:
-    image: whisperx-docker-ai-base:latest
-    build:
-      context: .
-      dockerfile: Dockerfile.ai-base
-    profiles: ["build-only"]
-
   whisperx:
     image: whisperx-docker:latest
     build:
       context: .
       dockerfile: Dockerfile
-    gpus: all
+    # Чтобы использовать GPU, раскомментируйте следующие строки:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
     environment:
+      # Можно переопределять через переменные окружения:
+      # WHISPERX_MODEL: base
+      # WHISPERX_DEVICE: cpu
+      # WHISPERX_COMPUTE_TYPE: int8
       NVIDIA_VISIBLE_DEVICES: all
-      WHISPERX_MODEL: large-v3
-      WHISPERX_LANGUAGE: ru
-      WHISPERX_DEVICE: cuda
-      WHISPERX_COMPUTE_TYPE: float16
-      WHISPERX_BATCH_SIZE: "16"
-      WHISPERX_ALIGN: "false"
-      WHISPERX_DIARIZE: "false"
-      WHISPERX_OUTPUT_FORMAT: txt
-      WHISPERX_SAVE_SEGMENTS: "false"
-      WHISPERX_AUDIO_EXTENSIONS: .mp3,.wav,.flac,.m4a,.ogg,.opus
     volumes:
       - ./input:/input
       - ./output:/output
+      - ./config:/config
       - whisperx-cache:/root/.cache/huggingface
+    # По умолчанию обрабатывает всё из /input в /output
     command: --input_dir /input --output_dir /output
 
 volumes:
