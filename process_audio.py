@@ -3,7 +3,8 @@
 
 """
 Пакетная транскрибация аудиофайлов (.wav) с помощью WhisperX в Docker.
-Фильтрация по размеру файла (минимальный размер задаётся через --min-size).
+Используется модель large-v3 для максимального качества.
+Фильтрация файлов по минимальному размеру (байты) – отсеиваются пустые или очень короткие записи.
 Результат сохраняется в JSON с вопросами из answers_full.json.
 """
 
@@ -25,8 +26,8 @@ DEFAULT_OUTPUT_JSON = Path("/storage/data/output.json")
 DEFAULT_MIN_SIZE_BYTES = 10000          # 10 КБ – минимальный размер файла для обработки
 DEFAULT_MAX_FILES = 30
 DEFAULT_WHISPERX_IMAGE = "whisperx-docker:latest"
-DEFAULT_MODEL = os.getenv("WHISPERX_MODEL", "small")   # на CPU small работает быстрее
-DEFAULT_LANGUAGE = "ru"                   # язык аудио
+DEFAULT_MODEL = "large-v3"              # максимальное качество
+DEFAULT_LANGUAGE = "ru"                 # язык аудио
 
 # Настройка логирования
 LOG_FILE = Path("/tmp/whisperx_process.log")
