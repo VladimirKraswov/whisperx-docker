@@ -1,7 +1,7 @@
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/whisperx-docker
 ignore: .codebundleignore
-generated: 2026-03-25T18:41:19.755Z
+generated: 2026-03-25T20:38:20.390Z
 
 
 
@@ -325,8 +325,8 @@ path: /default_config.yaml
 ----------------------------------------
 model: "large-v3"
 language: "ru"
-device: "cuda"
-compute_type: "float16"
+device: null # Автовыбор: cuda или cpu
+compute_type: null # Автовыбор: float16 (cuda) или int8 (cpu)
 batch_size: 16
 audio_extensions:
   - ".mp3"
@@ -348,35 +348,31 @@ download_root: null
 path: /docker-compose.yml
 ----------------------------------------
 services:
-  whisperx-base:
-    image: whisperx-docker-ai-base:latest
-    build:
-      context: .
-      dockerfile: Dockerfile.ai-base
-    profiles: ["build-only"]
-
   whisperx:
     image: whisperx-docker:latest
     build:
       context: .
       dockerfile: Dockerfile
-    gpus: all
+    # Чтобы использовать GPU, раскомментируйте следующие строки:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
     environment:
+      # Можно переопределять через переменные окружения:
+      # WHISPERX_MODEL: base
+      # WHISPERX_DEVICE: cpu
+      # WHISPERX_COMPUTE_TYPE: int8
       NVIDIA_VISIBLE_DEVICES: all
-      WHISPERX_MODEL: large-v3
-      WHISPERX_LANGUAGE: ru
-      WHISPERX_DEVICE: cuda
-      WHISPERX_COMPUTE_TYPE: float16
-      WHISPERX_BATCH_SIZE: "16"
-      WHISPERX_ALIGN: "false"
-      WHISPERX_DIARIZE: "false"
-      WHISPERX_OUTPUT_FORMAT: txt
-      WHISPERX_SAVE_SEGMENTS: "false"
-      WHISPERX_AUDIO_EXTENSIONS: .mp3,.wav,.flac,.m4a,.ogg,.opus
     volumes:
       - ./input:/input
       - ./output:/output
+      - ./config:/config
       - whisperx-cache:/root/.cache/huggingface
+    # По умолчанию обрабатывает всё из /input в /output
     command: --input_dir /input --output_dir /output
 
 volumes:
@@ -406,7 +402,7 @@ ENTRYPOINT ["/app/entrypoint.sh"]
 
 path: /Dockerfile.ai-base
 ----------------------------------------
-FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -420,9 +416,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     libsndfile1 \
-    cuda-nvrtc-12-8 \
-    libcublas-12-8 \
-    libcudnn8 \
+    cuda-nvrtc-12-4 \
+    libcublas-12-4 \
+    libcudnn9-cuda-12 \
     && rm -rf /var/lib/apt/lists/*
 
 # venv
@@ -436,8 +432,8 @@ COPY requirements.ai.txt /tmp/requirements.ai.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel && \
-    pip install --index-url https://download.pytorch.org/whl/cu128 \
-        torch==2.8.0 torchaudio==2.8.0 && \
+    pip install --index-url https://download.pytorch.org/whl/cu124 \
+        torch==2.4.1 torchaudio==2.4.1 && \
     pip install -r /tmp/requirements.ai.txt && \
     pip uninstall -y torchcodec || true
 
@@ -478,6 +474,228 @@ logs:
 
 clean-images:
 	docker image rm -f whisperx-docker:latest whisperx-docker-ai-base:latest || true
+
+
+path: /process_audio.py
+----------------------------------------
+#!/usr/bin/env python3
+import argparse
+import json
+import logging
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from datetime import datetime
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    stream=sys.stdout
+)
+logger = logging.getLogger("whisperx-orchestrator")
+
+DEFAULT_IMAGE = "whisperx-docker:latest"
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Orchestrator for WhisperX Docker transcription")
+    parser.add_argument("--input-dir", default="./input", help="Directory with source audio files")
+    parser.add_argument("--output-json", default="./output.json", help="Path to the final output JSON file")
+    parser.add_argument("--answers-json", default="answers_full.json", help="Path to the source answers/metadata JSON")
+    parser.add_argument("--model", default="large-v3", help="Whisper model to use")
+    parser.add_argument("--min-size", type=float, default=10, help="Minimum file size in KB to process")
+    parser.add_argument("--max-files", type=int, default=30, help="Maximum number of files to process in one batch")
+    parser.add_argument("--cache-dir", default="./whisperx-cache", help="Path to HuggingFace cache directory")
+    parser.add_argument("--keep-temp", action="store_true", help="Keep temporary directories after processing")
+    parser.add_argument("--device", choices=["cuda", "cpu", "auto"], default="auto", help="Device to use (default: auto)")
+    return parser
+
+def is_nvidia_gpu_available() -> bool:
+    try:
+        subprocess.run(["nvidia-smi"], capture_output=True, check=True)
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+
+def check_docker_image(image_name: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image_name],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        logger.error("Docker command not found. Is Docker installed?")
+        return False
+
+def extract_user_id(filename: str) -> int:
+    # Ожидается формат "ID_anything.wav"
+    parts = filename.split('_')
+    if parts and parts[0].isdigit():
+        return int(parts[0])
+    return 0
+
+def process_batch():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    input_dir = Path(args.input_dir).resolve()
+    output_json_path = Path(args.output_json).resolve()
+    answers_json_path = Path(args.answers_json).resolve()
+    cache_dir = Path(args.cache_dir).resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if not input_dir.exists():
+        logger.error(f"Input directory does not exist: {input_dir}")
+        sys.exit(1)
+
+    if not check_docker_image(DEFAULT_IMAGE):
+        logger.error(f"Docker image {DEFAULT_IMAGE} not found. Please build it first.")
+        sys.exit(1)
+
+    # 1. Поиск файлов по размеру
+    audio_extensions = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus"}
+    found_files = []
+    for item in sorted(input_dir.iterdir()):
+        if item.is_file() and item.suffix.lower() in audio_extensions:
+            size_kb = item.stat().st_size / 1024
+            if size_kb >= args.min_size:
+                found_files.append(item)
+                if len(found_files) >= args.max_files:
+                    break
+
+    if not found_files:
+        logger.info(f"No suitable audio files found in {input_dir} (min size {args.min_size} KB)")
+        return
+
+    logger.info(f"Found {len(found_files)} files for processing")
+
+    # 2. Создание временных папок
+    temp_input_dir = tempfile.mkdtemp(prefix="whisperx_in_")
+    temp_output_dir = tempfile.mkdtemp(prefix="whisperx_out_")
+    logger.info(f"Created temporary directories: {temp_input_dir}, {temp_output_dir}")
+
+    try:
+        # 3. Копирование файлов
+        for f in found_files:
+            logger.info(f"Copying {f.name} to temporary directory...")
+            shutil.copy2(f, Path(temp_input_dir) / f.name)
+
+        # 4. Запуск Docker
+        log_filename = f"whisperx_docker_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        logger.info(f"Starting Docker container. Logs will be saved to {log_filename}")
+
+        use_gpu = False
+        if args.device == "cuda":
+            use_gpu = True
+        elif args.device == "auto":
+            use_gpu = is_nvidia_gpu_available()
+
+        docker_cmd = [
+            "docker", "run", "--rm"
+        ]
+
+        if use_gpu:
+            docker_cmd.extend(["--gpus", "all"])
+            logger.info("Using GPU for Docker container")
+        else:
+            logger.info("Using CPU for Docker container")
+
+        docker_cmd.extend([
+            "-v", f"{temp_input_dir}:/input",
+            "-v", f"{temp_output_dir}:/output",
+            "-v", f"{cache_dir}:/root/.cache/huggingface",
+            DEFAULT_IMAGE,
+            "--input_dir", "/input",
+            "--output_dir", "/output",
+            "--model", args.model
+        ])
+
+        if args.device != "auto":
+            docker_cmd.extend(["--device", args.device])
+
+        with open(log_filename, "w", encoding="utf-8") as log_file:
+            process = subprocess.Popen(
+                docker_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+            for line in process.stdout:
+                log_file.write(line)
+                log_file.flush()
+                # Также выводим в консоль для прогресса
+                print(line.strip(), flush=True)
+
+            process.wait()
+
+        if process.returncode != 0:
+            logger.error(f"Docker container exited with error code {process.returncode}")
+            # Не выходим сразу, попробуем собрать то, что успели
+        else:
+            logger.info("Docker transcription completed successfully")
+
+        # 5. Сбор результатов и объединение с метаданными
+        answers_data = {}
+        if answers_json_path.exists():
+            try:
+                with open(answers_json_path, "r", encoding="utf-8") as af:
+                    answers_list = json.load(af)
+                    # Индексируем по file_name или как-то еще.
+                    # Но в оригинале answers_full.json может иметь разную структуру.
+                    # Предположим, это список объектов с file_name или мы сопоставляем по ID.
+                    if isinstance(answers_list, list):
+                        for item in answers_list:
+                            fname = item.get("file_name")
+                            if fname:
+                                answers_data[Path(fname).name] = item.get("question", "")
+            except Exception as e:
+                logger.warning(f"Could not read answers JSON: {e}")
+
+        final_records = []
+        for txt_file in Path(temp_output_dir).glob("*.txt"):
+            audio_name = txt_file.stem
+            # Ищем оригинальный путь файла среди найденных
+            orig_file = next((f for f in found_files if f.stem == audio_name), None)
+            if not orig_file:
+                continue
+
+            with open(txt_file, "r", encoding="utf-8") as f:
+                answer_text = f.read().strip()
+
+            final_records.append({
+                "user_id": extract_user_id(orig_file.name),
+                "question": answers_data.get(orig_file.name, ""),
+                "quiz_id": None,
+                "size": int(orig_file.stat().st_size / 1024),
+                "file_name": str(orig_file),
+                "answer": answer_text
+            })
+
+        if final_records:
+            logger.info(f"Saving {len(final_records)} records to {output_json_path}")
+            output_json_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_json_path, "w", encoding="utf-8") as f:
+                json.dump(final_records, f, ensure_ascii=False, indent=2)
+        else:
+            logger.warning("No transcription results found to save.")
+
+    finally:
+        if not args.keep_temp:
+            logger.info("Cleaning up temporary directories...")
+            shutil.rmtree(temp_input_dir, ignore_errors=True)
+            shutil.rmtree(temp_output_dir, ignore_errors=True)
+        else:
+            logger.info(f"Keeping temporary directories: {temp_input_dir}, {temp_output_dir}")
+
+if __name__ == "__main__":
+    process_batch()
 
 
 path: /README.md
@@ -750,71 +968,38 @@ with open(test_json, 'w', encoding='utf-8') as f:
 print("JSON обновлён")
 
 
-path: /transcribe_folder.py
-----------------------------------------
-import os
-import argparse
-import whisperx
-import torch
-from pathlib import Path
-
-def main():
-    parser = argparse.ArgumentParser(description='Транскрибация аудиофайлов из папки с помощью whisperX')
-    parser.add_argument('input_dir', help='Каталог с аудиозаписями')
-    parser.add_argument('output_dir', help='Каталог для сохранения текстов')
-    parser.add_argument('--model', default='small', help='Модель whisper (tiny, base, small, medium, large-v2, large-v3) или faster-whisper/*')
-    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', help='Устройство (cuda/cpu)')
-    parser.add_argument('--batch_size', type=int, default=16, help='Размер пакета для выравнивания')
-    parser.add_argument('--language', default='ru', help='Язык аудио (auto для автоопределения)')
-    parser.add_argument('--compute_type', default='float16' if torch.cuda.is_available() else 'int8', help='Тип вычислений')
-    args = parser.parse_args()
-
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    print(f"Загрузка модели {args.model} на устройство {args.device}...")
-    model = whisperx.load_model(args.model, args.device, compute_type=args.compute_type, language=args.language)
-
-    audio_extensions = ('.mp3', '.wav', '.flac', '.m4a', '.ogg', '.opus')
-    audio_files = [f for f in os.listdir(args.input_dir) if f.lower().endswith(audio_extensions)]
-
-    if not audio_files:
-        print("В указанной папке не найдено аудиофайлов.")
-        return
-
-    for audio_file in audio_files:
-        audio_path = os.path.join(args.input_dir, audio_file)
-        print(f"\nОбработка: {audio_file}")
-
-        result = model.transcribe(audio_path, batch_size=args.batch_size)
-
-        base_name = Path(audio_file).stem
-        output_file = os.path.join(args.output_dir, f"{base_name}.txt")
-
-        with open(output_file, 'w', encoding='utf-8') as f:
-            for segment in result["segments"]:
-                f.write(segment["text"].strip() + "\n")
-        print(f"Сохранён текст: {output_file}")
-
-if __name__ == "__main__":
-    main()
-
-
 path: /transcribe.py
 ----------------------------------------
 import argparse
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
 import requests
-import torch
-import whisperx
+try:
+    import torch
+    import whisperx
+except ImportError:
+    torch = None
+    whisperx = None
 import yaml
 
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    stream=sys.stdout
+)
+logger = logging.getLogger("whisperx-docker")
 
 DEFAULT_CONFIG_PATH = Path("/app/default_config.yaml")
+MOUNTED_CONFIG_PATH = Path("/config/config.yaml")
+DEFAULT_INPUT_DIR = "/input"
+DEFAULT_OUTPUT_DIR = "/output"
 DEFAULT_AUDIO_EXTENSIONS = [".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus"]
 
 
@@ -849,9 +1034,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("input_dir_pos", nargs="?", help="Input directory (positional compatibility mode)")
     parser.add_argument("output_dir_pos", nargs="?", help="Output directory (positional compatibility mode)")
 
-    parser.add_argument("--config", help="Path or URL to YAML config")
-    parser.add_argument("--input_dir", help="Directory with audio files")
-    parser.add_argument("--output_dir", help="Directory to save outputs")
+    parser.add_argument("--config", help=f"Path or URL to YAML config (default: {MOUNTED_CONFIG_PATH} if exists)")
+    parser.add_argument("--input_dir", default=DEFAULT_INPUT_DIR, help=f"Directory with audio files (default: {DEFAULT_INPUT_DIR})")
+    parser.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR, help=f"Directory to save outputs (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("--model", help="Whisper model name, e.g. large-v3")
     parser.add_argument("--language", help='Language code, e.g. "ru", "en", or "auto"')
     parser.add_argument("--device", help="cuda or cpu")
@@ -934,19 +1119,33 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
     config["audio_extensions"] = [str(ext).lower() for ext in config["audio_extensions"]]
 
     if not config.get("input_dir"):
-        raise ValueError("input_dir is required")
+        config["input_dir"] = DEFAULT_INPUT_DIR
     if not config.get("output_dir"):
-        raise ValueError("output_dir is required")
+        config["output_dir"] = DEFAULT_OUTPUT_DIR
 
     if config.get("language", "").lower() == "auto":
         config["language"] = "auto"
 
-    if config.get("device") == "cuda" and not torch.cuda.is_available():
-        print("[!] CUDA requested but not available. Falling back to CPU.")
+    # Автоматический выбор девайса
+    if not config.get("device"):
+        if torch:
+            config["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            config["device"] = "cpu"
+
+    if torch and config.get("device") == "cuda" and not torch.cuda.is_available():
+        logger.warning("CUDA requested but not available. Falling back to CPU.")
         config["device"] = "cpu"
 
+    # Настройка типа вычислений в зависимости от девайса
+    if not config.get("compute_type"):
+        if torch:
+            config["compute_type"] = "float16" if config["device"] == "cuda" else "int8"
+        else:
+            config["compute_type"] = "int8"
+
     if config.get("device") == "cpu" and config.get("compute_type") in {"float16", "bfloat16"}:
-        print("[!] compute_type=float16 is not suitable for CPU. Switching to int8.")
+        logger.warning(f"compute_type={config.get('compute_type')} is not suitable for CPU. Switching to int8.")
         config["compute_type"] = "int8"
 
     if config.get("diarize") and not config.get("hf_token"):
@@ -991,8 +1190,13 @@ def build_runtime_config(raw_args: list[str]) -> dict[str, Any]:
     parser = build_parser()
     args = parser.parse_args(raw_args)
 
+    config_path = args.config
+    if not config_path and MOUNTED_CONFIG_PATH.exists():
+        logger.info(f"Using mounted config file: {MOUNTED_CONFIG_PATH}")
+        config_path = str(MOUNTED_CONFIG_PATH)
+
     default_cfg = load_yaml_from_path_or_url(str(DEFAULT_CONFIG_PATH))
-    file_cfg = load_yaml_from_path_or_url(args.config)
+    file_cfg = load_yaml_from_path_or_url(config_path)
     env_cfg = load_env_overrides()
 
     cli_cfg = {
@@ -1014,7 +1218,7 @@ def main() -> None:
     try:
         config = build_runtime_config(sys.argv[1:])
     except Exception as exc:
-        print(f"[!] Configuration error: {exc}")
+        logger.error(f"Configuration error: {exc}")
         sys.exit(2)
 
     input_dir = Path(config["input_dir"]).expanduser().resolve()
@@ -1022,16 +1226,16 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if not input_dir.exists():
-        print(f"[!] Input directory does not exist: {input_dir}")
+        logger.error(f"Input directory does not exist: {input_dir}")
         sys.exit(2)
 
     audio_files = discover_audio_files(input_dir, config["audio_extensions"])
     if not audio_files:
-        print(f"[!] No audio files found in {input_dir}")
+        logger.warning(f"No audio files found in {input_dir}")
         sys.exit(0)
 
-    print("[*] Effective configuration:")
-    print(json.dumps(
+    logger.info("Effective configuration:")
+    logger.info(json.dumps(
         {
             "input_dir": str(input_dir),
             "output_dir": str(output_dir),
@@ -1053,7 +1257,7 @@ def main() -> None:
 
     load_language = None if config["language"] == "auto" else config["language"]
 
-    print(f"[*] Loading WhisperX model: {config['model']} on {config['device']} ({config['compute_type']})")
+    logger.info(f"Loading WhisperX model: {config['model']} on {config['device']} ({config['compute_type']})")
     model = whisperx.load_model(
         config["model"],
         config["device"],
@@ -1068,7 +1272,7 @@ def main() -> None:
     if config["diarize"]:
         from whisperx.diarize import DiarizationPipeline
 
-        print("[*] Initializing diarization pipeline")
+        logger.info("Initializing diarization pipeline")
         diarize_model = DiarizationPipeline(
             token=config["hf_token"],
             device=config["device"],
@@ -1078,7 +1282,7 @@ def main() -> None:
     failed = 0
 
     for audio_path in audio_files:
-        print(f"\n[*] Processing: {audio_path.name}")
+        logger.info(f"Processing: {audio_path.name}")
 
         try:
             audio = whisperx.load_audio(str(audio_path))
@@ -1094,7 +1298,7 @@ def main() -> None:
                     raise RuntimeError("Alignment requested but transcription did not return language")
 
                 if result_language not in align_cache:
-                    print(f"[*] Loading align model for language: {result_language}")
+                    logger.info(f"Loading align model for language: {result_language}")
                     align_cache[result_language] = whisperx.load_align_model(
                         language_code=result_language,
                         device=config["device"],
@@ -1126,25 +1330,25 @@ def main() -> None:
             if output_format == "txt":
                 output_file = output_dir / f"{base_name}.txt"
                 save_txt(output_file, result)
-                print(f"[*] Saved text: {output_file}")
+                logger.info(f"Saved text: {output_file}")
 
                 if config["save_segments"]:
                     segments_file = output_dir / f"{base_name}.segments.json"
                     save_segments_json(segments_file, result)
-                    print(f"[*] Saved segments JSON: {segments_file}")
+                    logger.info(f"Saved segments JSON: {segments_file}")
 
             elif output_format == "json":
                 output_file = output_dir / f"{base_name}.json"
                 save_json(output_file, result)
-                print(f"[*] Saved JSON: {output_file}")
+                logger.info(f"Saved JSON: {output_file}")
 
             processed += 1
 
         except Exception as exc:
             failed += 1
-            print(f"[!] Error processing {audio_path.name}: {exc}")
+            logger.error(f"Error processing {audio_path.name}: {exc}")
 
-    print(f"\n[*] Done. Processed: {processed}, failed: {failed}, total: {len(audio_files)}")
+    logger.info(f"Done. Processed: {processed}, failed: {failed}, total: {len(audio_files)}")
 
 
 if __name__ == "__main__":
@@ -1156,4 +1360,4 @@ included: 22
 skipped(binary): 0
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 33566
+totalBytes(approx): 41704
