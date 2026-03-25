@@ -28,8 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--answers-json", default="/storage/data/answers_full.json", help="Path to the source answers/metadata JSON")
     parser.add_argument("--model", default="large-v3", help="Whisper model to use")
     parser.add_argument("--language", default="ru", help="Language code (ru, en, auto, etc.)")
-    parser.add_argument("--min-size", type=float, default=10, help="Minimum file size in KB to process")
-    parser.add_argument("--max-files", type=int, default=30, help="Maximum number of files to process in one batch")
+    parser.add_argument("--min-size", type=float, default=0, help="Minimum file size in KB to process (0 = no filter)")
+    parser.add_argument("--max-files", type=int, default=0, help="Maximum number of files to process (0 = all)")
     parser.add_argument("--cache-dir", default="./whisperx-cache", help="Path to HuggingFace cache directory")
     parser.add_argument("--keep-temp", action="store_true", help="Keep temporary directories after processing")
     parser.add_argument("--device", choices=["cuda", "cpu", "auto"], default="auto", help="Device to use (default: auto)")
@@ -102,23 +102,24 @@ def process_batch():
         logger.error(f"Answers JSON not found at {answers_json_path}. Cannot proceed.")
         sys.exit(1)
 
-    # 2. Ищем файлы, присутствующие в индексе, и фильтруем по размеру
+    # 2. Проверяем каждый файл из индекса: существует ли он, подходит по размеру
     audio_extensions = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus"}
     found_files = []
-    for item in sorted(input_dir.iterdir()):
-        if not item.is_file() or item.suffix.lower() not in audio_extensions:
+    for audio_path in sorted(answers_index.keys()):
+        if not audio_path.exists():
+            logger.debug(f"Skipping {audio_path.name} – file not found")
             continue
-        resolved = item.resolve()
-        if resolved not in answers_index:
+        if audio_path.suffix.lower() not in audio_extensions:
+            logger.debug(f"Skipping {audio_path.name} – unsupported extension")
             continue
-        size_kb = item.stat().st_size / 1024
+        size_kb = audio_path.stat().st_size / 1024
         if size_kb >= args.min_size:
-            found_files.append(item)
-            if len(found_files) >= args.max_files:
+            found_files.append(audio_path)
+            if args.max_files > 0 and len(found_files) >= args.max_files:
                 break
 
     if not found_files:
-        logger.info(f"No suitable audio files found in {input_dir} (must be in answers JSON, min size {args.min_size} KB)")
+        logger.info(f"No suitable audio files found (must exist, min size {args.min_size} KB)")
         return
 
     logger.info(f"Found {len(found_files)} files for processing (out of {len(answers_index)} in answers JSON)")
@@ -192,7 +193,6 @@ def process_batch():
         final_records = []
         for txt_file in Path(temp_output_dir).glob("*.txt"):
             audio_name = txt_file.stem
-            # Ищем оригинальный файл среди найденных
             orig_file = next((f for f in found_files if f.stem == audio_name), None)
             if not orig_file:
                 logger.warning(f"Original file for {txt_file.name} not found, skipping.")
@@ -201,7 +201,6 @@ def process_batch():
             with open(txt_file, "r", encoding="utf-8") as f:
                 answer_text = f.read().strip()
 
-            # Получаем метаданные из индекса
             meta = answers_index.get(orig_file.resolve(), {})
             question = meta.get("question", "")
             quiz_id = meta.get("quiz_id", None)
