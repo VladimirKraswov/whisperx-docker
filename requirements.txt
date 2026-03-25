@@ -1,7 +1,2 @@
-torch==2.3.0+cu121 --index-url https://download.pytorch.org/whl/cu121
-whisperx
-transformers
-faster-whisper
-ctranslate2
-pyyaml
-requests
+-r requirements.app.txt
+-r requirements.ai.txt

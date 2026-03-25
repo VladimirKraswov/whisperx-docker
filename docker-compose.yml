@@ -1,11 +1,34 @@
-version: '3.8'
 services:
+  whisperx-base:
+    image: whisperx-docker-ai-base:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.ai-base
+    profiles: ["build-only"]
+
   whisperx:
-    build: .
+    image: whisperx-docker:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      WHISPERX_MODEL: large-v3
+      WHISPERX_LANGUAGE: ru
+      WHISPERX_DEVICE: cuda
+      WHISPERX_COMPUTE_TYPE: float16
+      WHISPERX_BATCH_SIZE: "16"
+      WHISPERX_ALIGN: "false"
+      WHISPERX_DIARIZE: "false"
+      WHISPERX_OUTPUT_FORMAT: txt
+      WHISPERX_SAVE_SEGMENTS: "false"
+      WHISPERX_AUDIO_EXTENSIONS: .mp3,.wav,.flac,.m4a,.ogg,.opus
     volumes:
-      - /путь/к/аудио:/input
-      - /путь/к/текстам:/output
-      - whisperx-cache:/root/.cache/huggingface  # кэш моделей
-    command: /input /output --model medium --language ru
+      - ./input:/input
+      - ./output:/output
+      - whisperx-cache:/root/.cache/huggingface
+    command: --input_dir /input --output_dir /output
+
 volumes:
   whisperx-cache:

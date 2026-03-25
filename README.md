@@ -1,76 +1,32 @@
-# Универсальный Docker-образ для транскрибации аудио с помощью whisperX
+# WhisperX Docker
 
-Этот инструмент позволяет легко транскрибировать аудиофайлы в каталоге, используя [whisperX](https://github.com/m-bain/whisperX). Оптимизирован для GPU (RTX 5090 и другие).
+Аккуратно собранный Docker-проект для пакетной транскрибации аудио через WhisperX.
 
-## Особенности
-- **Гибкая конфигурация**: через файл (локальный или удалённый), переменные окружения или аргументы командной строки.
-- **Высокая производительность**: использование `faster-whisper` и поддержка CUDA 12.
-- **Поддержка различных форматов**: вывод в TXT или JSON.
-- **Автоматизация**: запуск одной командой `docker run`.
+## Что изменено
 
-## Быстрый старт (с дефолтными настройками)
-По умолчанию используется модель `large-v3`, `batch_size: 128`, язык `ru`.
+Проект переделан по той же схеме, что и рабочий `qwen-tts-webui`:
 
-```bash
-docker run --rm --gpus all \
-  -v /путь/к/аудио:/input \
-  -v /путь/к/текстам:/output \
-  -v whisperx-cache:/root/.cache/huggingface \
-  whisperx-transcriber \
-  --input /input \
-  --output /output
-```
+- тяжёлый AI-слой вынесен в отдельный базовый образ;
+- лёгкий app-слой ставится поверх него;
+- убраны устаревшие версии CUDA / PyTorch;
+- конфигурация теперь объединяется в одном Python-скрипте, без сложной bash-магии;
+- добавлена поддержка:
+  - локального YAML-конфига,
+  - YAML по URL,
+  - переменных окружения `WHISPERX_*`,
+  - аргументов командной строки.
 
-## Использование с конфигурационным файлом
+## Структура
 
-### Локальный конфиг
-Вы можете смонтировать свой `config.yaml` в контейнер:
+- `Dockerfile.ai-base` — CUDA, PyTorch, WhisperX и тяжёлые зависимости
+- `Dockerfile` — лёгкий runtime-слой
+- `transcribe.py` — основной CLI-инструмент
+- `default_config.yaml` — дефолтная конфигурация
+- `docker-compose.yml` — готовый запуск с папками `./input` и `./output`
 
-```bash
-docker run --rm --gpus all \
-  -v /путь/к/аудио:/input \
-  -v /путь/к/текстам:/output \
-  -v /путь/к/my_config.yaml:/config.yaml \
-  whisperx-transcriber \
-  --config /config.yaml \
-  --input /input \
-  --output /output
-```
+## Первый запуск
 
-### Удалённый конфиг (по URL)
-```bash
-docker run --rm --gpus all \
-  -v /путь/к/аудио:/input \
-  -v /путь/к/текстам:/output \
-  whisperx-transcriber \
-  --config https://example.com/my_config.yaml \
-  --input /input \
-  --output /output
-```
-
-## Настройка через переменные окружения
-Вы можете переопределить любой параметр, используя префикс `WHISPERX_`:
+Собери AI-базу:
 
 ```bash
-docker run --rm --gpus all \
-  -e WHISPERX_MODEL=medium \
-  -e WHISPERX_BATCH_SIZE=32 \
-  -v /путь/к/аудио:/input \
-  -v /путь/к/текстам:/output \
-  whisperx-transcriber \
-  --input /input \
-  --output /output
-```
-
-## Доступные параметры
-| Параметр | Описание | Дефолт |
-|----------|----------|---------|
-| `model` | ID модели whisper | `faster-whisper/large-v3` |
-| `language`| Язык (ru, en, auto) | `ru` |
-| `device` | Устройство (cuda/cpu) | `cuda` |
-| `batch_size` | Размер батча | `128` |
-| `align` | Выполнять ли выравнивание | `false` |
-| `output_format` | Формат вывода (txt/json) | `txt` |
-
-## Приоритет параметров
-Аргументы командной строки > Переменные окружения > Файл конфигурации > Дефолтные настройки.
+docker compose build whisperx-base
