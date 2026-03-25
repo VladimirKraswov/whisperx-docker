@@ -25,22 +25,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --index-url https://download.pytorch.org/whl/cu128 \
       torch==2.8.0 torchaudio==2.8.0 && \
     pip install -r /tmp/requirements.ai.txt && \
-    python - <<'PY'
-from pathlib import Path
-import nvidia.cublas.lib
-import nvidia.cudnn.lib
-
-target = Path("/opt/nvidia-python-libs")
-target.mkdir(parents=True, exist_ok=True)
-
-for module in (nvidia.cublas.lib, nvidia.cudnn.lib):
-    src_dir = Path(module.__file__).resolve().parent
-    for lib in src_dir.glob("*.so*"):
-        dst = target / lib.name
-        if not dst.exists():
-            dst.symlink_to(lib)
-
-print(f"Linked runtime CUDA libs to {target}")
-PY
+    mkdir -p /opt/nvidia-python-libs && \
+    find /venv/lib/python3.12/site-packages/nvidia \
+      \( -path "*/cublas/lib/*.so*" -o -path "*/cudnn/lib/*.so*" \) \
+      -type f -exec ln -sf {} /opt/nvidia-python-libs/ \;
 
 ENV LD_LIBRARY_PATH="/opt/nvidia-python-libs:${LD_LIBRARY_PATH}"
