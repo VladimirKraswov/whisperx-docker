@@ -23,10 +23,11 @@ DEFAULT_IMAGE = "whisperx-docker:latest"
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Orchestrator for WhisperX Docker transcription")
-    parser.add_argument("--input-dir", default="./input", help="Directory with source audio files")
-    parser.add_argument("--output-json", default="./output.json", help="Path to the final output JSON file")
-    parser.add_argument("--answers-json", default="answers_full.json", help="Path to the source answers/metadata JSON")
+    parser.add_argument("--input-dir", default="/storage/data/audio", help="Directory with source audio files")
+    parser.add_argument("--output-json", default="/storage/data/output.json", help="Path to the final output JSON file")
+    parser.add_argument("--answers-json", default="/storage/data/answers_full.json", help="Path to the source answers/metadata JSON")
     parser.add_argument("--model", default="large-v3", help="Whisper model to use")
+    parser.add_argument("--language", default="ru", help="Language code (ru, en, auto, etc.)")
     parser.add_argument("--min-size", type=float, default=10, help="Minimum file size in KB to process")
     parser.add_argument("--max-files", type=int, default=30, help="Maximum number of files to process in one batch")
     parser.add_argument("--cache-dir", default="./whisperx-cache", help="Path to HuggingFace cache directory")
@@ -55,7 +56,6 @@ def check_docker_image(image_name: str) -> bool:
         return False
 
 def extract_user_id(filename: str) -> int:
-    # Ожидается формат "ID_anything.wav"
     parts = filename.split('_')
     if parts and parts[0].isdigit():
         return int(parts[0])
@@ -96,18 +96,38 @@ def process_batch():
 
     logger.info(f"Found {len(found_files)} files for processing")
 
-    # 2. Создание временных папок
+    # 2. Загрузка метаданных из answers_full.json (индекс по полному пути)
+    answers_index = {}
+    if answers_json_path.exists():
+        try:
+            with open(answers_json_path, "r", encoding="utf-8") as f:
+                answers_list = json.load(f)
+            logger.info(f"Loading {len(answers_list)} metadata records from {answers_json_path}")
+            for item in answers_list:
+                fpath = item.get("file_name")
+                if fpath:
+                    # Используем полный путь как ключ
+                    answers_index[Path(fpath).resolve()] = {
+                        "question": item.get("question", ""),
+                        "quiz_id": item.get("quiz_id", None)
+                    }
+        except Exception as e:
+            logger.warning(f"Could not read answers JSON: {e}")
+    else:
+        logger.warning(f"Answers JSON not found at {answers_json_path}. Questions and quiz_id will be empty.")
+
+    # 3. Создание временных папок
     temp_input_dir = tempfile.mkdtemp(prefix="whisperx_in_")
     temp_output_dir = tempfile.mkdtemp(prefix="whisperx_out_")
     logger.info(f"Created temporary directories: {temp_input_dir}, {temp_output_dir}")
 
     try:
-        # 3. Копирование файлов
+        # 4. Копирование файлов
         for f in found_files:
             logger.info(f"Copying {f.name} to temporary directory...")
             shutil.copy2(f, Path(temp_input_dir) / f.name)
 
-        # 4. Запуск Docker
+        # 5. Запуск Docker
         log_filename = f"whisperx_docker_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         logger.info(f"Starting Docker container. Logs will be saved to {log_filename}")
 
@@ -134,7 +154,8 @@ def process_batch():
             DEFAULT_IMAGE,
             "--input_dir", "/input",
             "--output_dir", "/output",
-            "--model", args.model
+            "--model", args.model,
+            "--language", args.language          # добавляем язык
         ])
 
         if args.device != "auto":
@@ -150,51 +171,38 @@ def process_batch():
             for line in process.stdout:
                 log_file.write(line)
                 log_file.flush()
-                # Также выводим в консоль для прогресса
                 print(line.strip(), flush=True)
 
             process.wait()
 
         if process.returncode != 0:
             logger.error(f"Docker container exited with error code {process.returncode}")
-            # Не выходим сразу, попробуем собрать то, что успели
+            # Продолжаем, чтобы собрать хотя бы частичные результаты
         else:
             logger.info("Docker transcription completed successfully")
 
-        # 5. Сбор результатов и объединение с метаданными
-        answers_data = {}
-        if answers_json_path.exists():
-            try:
-                # Читаем только если нужно, и эффективно.
-                # С 450к записями это может занять память, поэтому выводим лог.
-                logger.info(f"Loading metadata from {answers_json_path}...")
-                with open(answers_json_path, "r", encoding="utf-8") as af:
-                    answers_list = json.load(af)
-                    if isinstance(answers_list, list):
-                        logger.info(f"Loaded {len(answers_list)} metadata records")
-                        # Индексируем по имени файла для быстрого поиска
-                        for item in answers_list:
-                            fname = item.get("file_name")
-                            if fname:
-                                answers_data[Path(fname).name] = item.get("question", "")
-            except Exception as e:
-                logger.warning(f"Could not read answers JSON: {e}")
-
+        # 6. Сбор результатов и объединение с метаданными
         final_records = []
         for txt_file in Path(temp_output_dir).glob("*.txt"):
             audio_name = txt_file.stem
-            # Ищем оригинальный путь файла среди найденных
+            # Ищем оригинальный файл среди найденных
             orig_file = next((f for f in found_files if f.stem == audio_name), None)
             if not orig_file:
+                logger.warning(f"Original file for {txt_file.name} not found, skipping.")
                 continue
 
             with open(txt_file, "r", encoding="utf-8") as f:
                 answer_text = f.read().strip()
 
+            # Получаем метаданные по полному пути
+            meta = answers_index.get(orig_file.resolve(), {})
+            question = meta.get("question", "")
+            quiz_id = meta.get("quiz_id", None)
+
             final_records.append({
                 "user_id": extract_user_id(orig_file.name),
-                "question": answers_data.get(orig_file.name, ""),
-                "quiz_id": None,
+                "question": question,
+                "quiz_id": quiz_id,
                 "size": int(orig_file.stat().st_size / 1024),
                 "file_name": str(orig_file),
                 "answer": answer_text
