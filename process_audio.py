@@ -1,33 +1,27 @@
 #!/usr/bin/env python3
-"""
-Обработка первых 30 аудиофайлов из /storage/data/audio длительностью >5 сек,
-транскрибация через WhisperX (Docker) и сохранение результата в output.json.
-"""
-
 import json
 import os
 import subprocess
 import sys
+import shutil
 from pathlib import Path
-import wave
 
 AUDIO_DIR = Path("/storage/data/audio")
 OUTPUT_JSON = Path("/storage/data/output.json")
 TEMP_INPUT_DIR = Path("/tmp/whisperx_input")
 TEMP_OUTPUT_DIR = Path("/tmp/whisperx_output")
-DURATION_THRESHOLD = 5.0   # секунды
+DURATION_THRESHOLD = 5.0
 MAX_FILES = 30
+WHISPERX_IMAGE = "whisperx-docker:latest"
 
 def check_ffprobe():
-    """Проверяет доступность ffprobe."""
     try:
         subprocess.run(['ffprobe', '-version'], capture_output=True, check=True)
         return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except:
         return False
 
-def get_duration_ffprobe(filepath: Path) -> float:
-    """Получает длительность через ffprobe."""
+def get_duration_ffprobe(filepath):
     result = subprocess.run(
         ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
          '-of', 'default=noprint_wrappers=1:nokey=1', str(filepath)],
@@ -35,130 +29,105 @@ def get_duration_ffprobe(filepath: Path) -> float:
     )
     return float(result.stdout.strip())
 
-def get_duration_wave(filepath: Path) -> float:
-    """Пытается получить длительность через wave (только для настоящих WAV)."""
-    try:
-        with wave.open(str(filepath), 'rb') as wav:
-            frames = wav.getnframes()
-            rate = wav.getframerate()
-            return frames / rate
-    except Exception:
-        return 0.0
-
-def get_duration(filepath: Path) -> float:
-    """Обёртка: сначала ffprobe, если не работает, пробует wave."""
+def get_duration(filepath):
     if check_ffprobe():
         try:
             return get_duration_ffprobe(filepath)
-        except (subprocess.CalledProcessError, ValueError):
-            # если ffprobe не смог, пробуем wave
-            return get_duration_wave(filepath)
+        except:
+            return 0.0
     else:
-        # если ffprobe нет, просто используем wave
-        return get_duration_wave(filepath)
+        print("Внимание: ffprobe не найден. Длительность не проверяется.")
+        return float('inf')
 
 def find_audio_files():
-    """Находит все .wav файлы, фильтрует по длительности, возвращает первые MAX_FILES."""
-    wav_files = sorted(AUDIO_DIR.glob("*.wav"))  # сортировка по имени
+    wav_files = sorted(AUDIO_DIR.glob("*.wav"))
     valid = []
-    ffprobe_available = check_ffprobe()
-    if not ffprobe_available:
-        print("Внимание: ffprobe не найден. Фильтрация по длительности отключена.")
     for f in wav_files:
-        if ffprobe_available:
-            duration = get_duration(f)
-            if duration > DURATION_THRESHOLD:
-                valid.append(f)
-        else:
-            valid.append(f)  # берём все файлы
-        if len(valid) >= MAX_FILES:
-            break
+        duration = get_duration(f)
+        if duration > DURATION_THRESHOLD:
+            valid.append(f)
+            if len(valid) >= MAX_FILES:
+                break
     return valid
 
-def extract_user_id(filename: Path) -> int:
+def extract_user_id(filename):
     parts = filename.stem.split('_')
-    if parts and parts[0].isdigit():
-        return int(parts[0])
-    return 0
+    return int(parts[0]) if parts and parts[0].isdigit() else 0
 
-def build_initial_json(files):
-    records = []
+def symlink_files(files, target_dir):
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True)
     for f in files:
-        size_kb = os.path.getsize(f) // 1024
+        os.symlink(f, target_dir / f.name)
+
+def run_docker_transcription():
+    print("Запуск транскрибации через Docker (это может занять время)...")
+    cmd = [
+        "docker", "run", "--rm",
+        "-v", f"{TEMP_INPUT_DIR}:/input",
+        "-v", f"{TEMP_OUTPUT_DIR}:/output",
+        WHISPERX_IMAGE,
+        "--input_dir", "/input",
+        "--output_dir", "/output"
+    ]
+    result = subprocess.run(cmd, capture_output=False)
+    if result.returncode != 0:
+        print("Ошибка при выполнении Docker. Смотрите вывод выше.")
+        sys.exit(1)
+
+def build_json_from_transcriptions():
+    """Создает JSON на основе файлов .txt в TEMP_OUTPUT_DIR."""
+    records = []
+    for txt_file in TEMP_OUTPUT_DIR.glob("*.txt"):
+        base = txt_file.stem  # имя без расширения
+        # Ищем соответствующий .wav в исходной папке или во временной папке
+        wav_path = AUDIO_DIR / f"{base}.wav"
+        if not wav_path.exists():
+            # может быть в TEMP_INPUT_DIR (симлинк)
+            wav_path = TEMP_INPUT_DIR / f"{base}.wav"
+            if not wav_path.exists():
+                print(f"Предупреждение: не найден исходный аудиофайл для {base}")
+                continue
+        size_kb = os.path.getsize(wav_path) // 1024
+        with open(txt_file, 'r', encoding='utf-8') as f:
+            answer = f.read().strip()
         records.append({
-            "user_id": extract_user_id(f),
+            "user_id": extract_user_id(wav_path),
             "question": "",
             "quiz_id": None,
             "size": size_kb,
-            "file_name": str(f),
-            "answer": ""
+            "file_name": str(wav_path),
+            "answer": answer
         })
     return records
 
-def symlink_files(files, target_dir):
-    target_dir.mkdir(parents=True, exist_ok=True)
-    for f in files:
-        link_path = target_dir / f.name
-        # Удаляем существующий файл или симлинк, если он есть
-        if link_path.exists() or link_path.is_symlink():
-            link_path.unlink()
-        os.symlink(f, link_path)
-
-def run_docker_transcription():
-    cmd = [
-        "docker", "compose", "run", "--rm",
-        "-v", f"{TEMP_INPUT_DIR}:/input",
-        "-v", f"{TEMP_OUTPUT_DIR}:/output",
-        "whisperx"
-    ]
-    print("Запуск транскрибации в Docker...")
-    subprocess.run(cmd, check=True)
-
-def update_json_with_transcriptions(records):
-    for rec in records:
-        base = Path(rec["file_name"]).stem
-        txt_path = TEMP_OUTPUT_DIR / f"{base}.txt"
-        if txt_path.exists():
-            with open(txt_path, 'r', encoding='utf-8') as f:
-                rec["answer"] = f.read().strip()
-        else:
-            print(f"Предупреждение: нет транскрипции для {base}")
-    return records
-
 def main():
-    print("Шаг 1: Поиск аудиофайлов...")
+    print("Шаг 1: Поиск аудиофайлов длительностью >5 секунд...")
     files = find_audio_files()
     print(f"Найдено {len(files)} файлов (берём первые {MAX_FILES})")
-
     if not files:
         print("Нет подходящих файлов. Выход.")
         return
 
-    print("Шаг 2: Формирование начального JSON...")
-    records = build_initial_json(files)
-
-    # Сохраняем промежуточный JSON (опционально)
-    with open("/tmp/input_files.json", 'w', encoding='utf-8') as f:
-        json.dump(records, f, ensure_ascii=False, indent=2)
-
-    print("Шаг 3: Создание симлинков во входную папку Docker...")
+    print("Шаг 2: Создание симлинков во входную папку Docker...")
     symlink_files(files, TEMP_INPUT_DIR)
 
-    print("Шаг 4: Запуск транскрибации (может занять время)...")
-    try:
-        run_docker_transcription()
-    except subprocess.CalledProcessError as e:
-        print(f"Ошибка Docker: {e}")
-        sys.exit(1)
+    print("Шаг 3: Запуск транскрибации...")
+    run_docker_transcription()
 
-    print("Шаг 5: Обновление JSON полученными текстами...")
-    updated = update_json_with_transcriptions(records)
+    print("Шаг 4: Формирование JSON из транскрипций...")
+    records = build_json_from_transcriptions()
+    if not records:
+        print("Не удалось сформировать записи. Выход.")
+        return
 
-    print(f"Шаг 6: Сохранение итогового JSON в {OUTPUT_JSON}")
+    print(f"Шаг 5: Сохранение в {OUTPUT_JSON}")
+    OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_JSON, 'w', encoding='utf-8') as f:
-        json.dump(updated, f, ensure_ascii=False, indent=2)
+        json.dump(records, f, ensure_ascii=False, indent=2)
 
-    print("Готово.")
+    print(f"Готово. Обработано {len(records)} файлов.")
 
 if __name__ == "__main__":
     main()
