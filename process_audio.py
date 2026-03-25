@@ -11,7 +11,6 @@ import sys
 from pathlib import Path
 import wave
 
-# Константы
 AUDIO_DIR = Path("/storage/data/audio")
 OUTPUT_JSON = Path("/storage/data/output.json")
 TEMP_INPUT_DIR = Path("/tmp/whisperx_input")
@@ -19,38 +18,70 @@ TEMP_OUTPUT_DIR = Path("/tmp/whisperx_output")
 DURATION_THRESHOLD = 5.0   # секунды
 MAX_FILES = 30
 
-def get_wav_duration(filepath: Path) -> float:
-    """Возвращает длительность WAV-файла в секундах."""
+def check_ffprobe():
+    """Проверяет доступность ffprobe."""
+    try:
+        subprocess.run(['ffprobe', '-version'], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+def get_duration_ffprobe(filepath: Path) -> float:
+    """Получает длительность через ffprobe."""
+    result = subprocess.run(
+        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+         '-of', 'default=noprint_wrappers=1:nokey=1', str(filepath)],
+        capture_output=True, text=True, check=True
+    )
+    return float(result.stdout.strip())
+
+def get_duration_wave(filepath: Path) -> float:
+    """Пытается получить длительность через wave (только для настоящих WAV)."""
     try:
         with wave.open(str(filepath), 'rb') as wav:
             frames = wav.getnframes()
             rate = wav.getframerate()
             return frames / rate
-    except Exception as e:
-        print(f"Ошибка чтения {filepath}: {e}")
+    except Exception:
         return 0.0
+
+def get_duration(filepath: Path) -> float:
+    """Обёртка: сначала ffprobe, если не работает, пробует wave."""
+    if check_ffprobe():
+        try:
+            return get_duration_ffprobe(filepath)
+        except (subprocess.CalledProcessError, ValueError):
+            # если ffprobe не смог, пробуем wave
+            return get_duration_wave(filepath)
+    else:
+        # если ffprobe нет, просто используем wave
+        return get_duration_wave(filepath)
 
 def find_audio_files():
     """Находит все .wav файлы, фильтрует по длительности, возвращает первые MAX_FILES."""
     wav_files = sorted(AUDIO_DIR.glob("*.wav"))  # сортировка по имени
     valid = []
+    ffprobe_available = check_ffprobe()
+    if not ffprobe_available:
+        print("Внимание: ffprobe не найден. Фильтрация по длительности отключена.")
     for f in wav_files:
-        duration = get_wav_duration(f)
-        if duration > DURATION_THRESHOLD:
-            valid.append(f)
-            if len(valid) >= MAX_FILES:
-                break
+        if ffprobe_available:
+            duration = get_duration(f)
+            if duration > DURATION_THRESHOLD:
+                valid.append(f)
+        else:
+            valid.append(f)  # берём все файлы
+        if len(valid) >= MAX_FILES:
+            break
     return valid
 
 def extract_user_id(filename: Path) -> int:
-    """Извлекает user_id из имени файла (первая часть до '_')."""
     parts = filename.stem.split('_')
     if parts and parts[0].isdigit():
         return int(parts[0])
     return 0
 
 def build_initial_json(files):
-    """Создаёт список записей с пустыми answer."""
     records = []
     for f in files:
         size_kb = os.path.getsize(f) // 1024
@@ -65,7 +96,6 @@ def build_initial_json(files):
     return records
 
 def symlink_files(files, target_dir):
-    """Создаёт симлинки на отобранные файлы в target_dir."""
     target_dir.mkdir(parents=True, exist_ok=True)
     for f in files:
         link_path = target_dir / f.name
@@ -73,7 +103,6 @@ def symlink_files(files, target_dir):
             os.symlink(f, link_path)
 
 def run_docker_transcription():
-    """Запускает транскрибацию через Docker."""
     cmd = [
         "docker", "compose", "run", "--rm",
         "-v", f"{TEMP_INPUT_DIR}:/input",
@@ -84,7 +113,6 @@ def run_docker_transcription():
     subprocess.run(cmd, check=True)
 
 def update_json_with_transcriptions(records):
-    """Считывает .txt файлы из TEMP_OUTPUT_DIR и заполняет answer."""
     for rec in records:
         base = Path(rec["file_name"]).stem
         txt_path = TEMP_OUTPUT_DIR / f"{base}.txt"
@@ -96,7 +124,7 @@ def update_json_with_transcriptions(records):
     return records
 
 def main():
-    print("Шаг 1: Поиск аудиофайлов длительностью >5 секунд...")
+    print("Шаг 1: Поиск аудиофайлов...")
     files = find_audio_files()
     print(f"Найдено {len(files)} файлов (берём первые {MAX_FILES})")
 
