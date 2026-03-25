@@ -25,9 +25,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Orchestrator for WhisperX Docker transcription")
     parser.add_argument("--input-dir", default="./input", help="Directory with source audio files")
     parser.add_argument("--output-json", default="./output.json", help="Path to the final output JSON file")
+<<<<<<< HEAD
     parser.add_argument("--answers-json", default="/storage/data/answers_full.json", help="Path to the source answers/metadata JSON")
     parser.add_argument("--model", default="large-v3", help="Whisper model to use")
     parser.add_argument("--language", default="ru", help="Language code (ru, en, auto, etc.)")
+=======
+    parser.add_argument("--answers-json", default="answers_full.json", help="Path to the source answers/metadata JSON")
+    parser.add_argument("--model", default="large-v3", help="Whisper model to use")
+>>>>>>> 0907c7c (Complete WhisperX service refactor and new orchestrator)
     parser.add_argument("--min-size", type=float, default=10, help="Minimum file size in KB to process")
     parser.add_argument("--max-files", type=int, default=30, help="Maximum number of files to process in one batch")
     parser.add_argument("--cache-dir", default="./whisperx-cache", help="Path to HuggingFace cache directory")
@@ -56,6 +61,10 @@ def check_docker_image(image_name: str) -> bool:
         return False
 
 def extract_user_id(filename: str) -> int:
+<<<<<<< HEAD
+=======
+    # Ожидается формат "ID_anything.wav"
+>>>>>>> 0907c7c (Complete WhisperX service refactor and new orchestrator)
     parts = filename.split('_')
     if parts and parts[0].isdigit():
         return int(parts[0])
@@ -96,6 +105,7 @@ def process_batch():
 
     logger.info(f"Found {len(found_files)} files for processing")
 
+<<<<<<< HEAD
     # 2. Загрузка метаданных из answers_full.json
     answers_index = {}
     if answers_json_path.exists():
@@ -114,17 +124,28 @@ def process_batch():
         logger.warning(f"Answers JSON not found at {answers_json_path}. Questions and quiz_id will be empty.")
 
     # 3. Создание временных папок
+=======
+    # 2. Создание временных папок
+>>>>>>> 0907c7c (Complete WhisperX service refactor and new orchestrator)
     temp_input_dir = tempfile.mkdtemp(prefix="whisperx_in_")
     temp_output_dir = tempfile.mkdtemp(prefix="whisperx_out_")
     logger.info(f"Created temporary directories: {temp_input_dir}, {temp_output_dir}")
 
     try:
+<<<<<<< HEAD
         # 4. Копирование файлов
+=======
+        # 3. Копирование файлов
+>>>>>>> 0907c7c (Complete WhisperX service refactor and new orchestrator)
         for f in found_files:
             logger.info(f"Copying {f.name} to temporary directory...")
             shutil.copy2(f, Path(temp_input_dir) / f.name)
 
+<<<<<<< HEAD
         # 5. Запуск Docker
+=======
+        # 4. Запуск Docker
+>>>>>>> 0907c7c (Complete WhisperX service refactor and new orchestrator)
         log_filename = f"whisperx_docker_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         logger.info(f"Starting Docker container. Logs will be saved to {log_filename}")
 
@@ -151,8 +172,12 @@ def process_batch():
             DEFAULT_IMAGE,
             "--input_dir", "/input",
             "--output_dir", "/output",
+<<<<<<< HEAD
             "--model", args.model,
             "--language", args.language
+=======
+            "--model", args.model
+>>>>>>> 0907c7c (Complete WhisperX service refactor and new orchestrator)
         ])
 
         if args.device != "auto":
@@ -168,12 +193,17 @@ def process_batch():
             for line in process.stdout:
                 log_file.write(line)
                 log_file.flush()
+<<<<<<< HEAD
+=======
+                # Также выводим в консоль для прогресса
+>>>>>>> 0907c7c (Complete WhisperX service refactor and new orchestrator)
                 print(line.strip(), flush=True)
 
             process.wait()
 
         if process.returncode != 0:
             logger.error(f"Docker container exited with error code {process.returncode}")
+<<<<<<< HEAD
             # Продолжаем, чтобы собрать хотя бы частичные результаты
         else:
             logger.info("Docker transcription completed successfully")
@@ -186,11 +216,41 @@ def process_batch():
             orig_file = next((f for f in found_files if f.stem == audio_name), None)
             if not orig_file:
                 logger.warning(f"Original file for {txt_file.name} not found, skipping.")
+=======
+            # Не выходим сразу, попробуем собрать то, что успели
+        else:
+            logger.info("Docker transcription completed successfully")
+
+        # 5. Сбор результатов и объединение с метаданными
+        answers_data = {}
+        if answers_json_path.exists():
+            try:
+                with open(answers_json_path, "r", encoding="utf-8") as af:
+                    answers_list = json.load(af)
+                    # Индексируем по file_name или как-то еще.
+                    # Но в оригинале answers_full.json может иметь разную структуру.
+                    # Предположим, это список объектов с file_name или мы сопоставляем по ID.
+                    if isinstance(answers_list, list):
+                        for item in answers_list:
+                            fname = item.get("file_name")
+                            if fname:
+                                answers_data[Path(fname).name] = item.get("question", "")
+            except Exception as e:
+                logger.warning(f"Could not read answers JSON: {e}")
+
+        final_records = []
+        for txt_file in Path(temp_output_dir).glob("*.txt"):
+            audio_name = txt_file.stem
+            # Ищем оригинальный путь файла среди найденных
+            orig_file = next((f for f in found_files if f.stem == audio_name), None)
+            if not orig_file:
+>>>>>>> 0907c7c (Complete WhisperX service refactor and new orchestrator)
                 continue
 
             with open(txt_file, "r", encoding="utf-8") as f:
                 answer_text = f.read().strip()
 
+<<<<<<< HEAD
             # Поиск метаданных по полному пути
             meta = answers_index.get(orig_file.resolve(), {})
             question = meta.get("question", "")
@@ -200,6 +260,12 @@ def process_batch():
                 "user_id": extract_user_id(orig_file.name),
                 "question": question,
                 "quiz_id": quiz_id,
+=======
+            final_records.append({
+                "user_id": extract_user_id(orig_file.name),
+                "question": answers_data.get(orig_file.name, ""),
+                "quiz_id": None,
+>>>>>>> 0907c7c (Complete WhisperX service refactor and new orchestrator)
                 "size": int(orig_file.stat().st_size / 1024),
                 "file_name": str(orig_file),
                 "answer": answer_text
@@ -222,4 +288,8 @@ def process_batch():
             logger.info(f"Keeping temporary directories: {temp_input_dir}, {temp_output_dir}")
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     process_batch()
+=======
+    process_batch()
+>>>>>>> 0907c7c (Complete WhisperX service refactor and new orchestrator)
