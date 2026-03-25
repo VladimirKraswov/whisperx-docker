@@ -99,8 +99,10 @@ def symlink_files(files, target_dir):
     target_dir.mkdir(parents=True, exist_ok=True)
     for f in files:
         link_path = target_dir / f.name
-        if not link_path.exists():
-            os.symlink(f, link_path)
+        # Удаляем существующий файл или симлинк, если он есть
+        if link_path.exists() or link_path.is_symlink():
+            link_path.unlink()
+        os.symlink(f, link_path)
 
 def run_docker_transcription():
     cmd = [
