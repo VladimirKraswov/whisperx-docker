@@ -54,12 +54,13 @@ def extract_user_id(filename):
     parts = filename.stem.split('_')
     return int(parts[0]) if parts and parts[0].isdigit() else 0
 
-def symlink_files(files, target_dir):
+def copy_files(files, target_dir):
     if target_dir.exists():
         shutil.rmtree(target_dir)
     target_dir.mkdir(parents=True)
     for f in files:
-        os.symlink(f, target_dir / f.name)
+        dest = target_dir / f.name
+        shutil.copy2(f, dest)  # копируем, сохраняя метаданные
 
 def run_docker_transcription():
     print("Запуск транскрибации через Docker (это может занять время)...")
@@ -77,18 +78,14 @@ def run_docker_transcription():
         sys.exit(1)
 
 def build_json_from_transcriptions():
-    """Создает JSON на основе файлов .txt в TEMP_OUTPUT_DIR."""
     records = []
     for txt_file in TEMP_OUTPUT_DIR.glob("*.txt"):
-        base = txt_file.stem  # имя без расширения
-        # Ищем соответствующий .wav в исходной папке или во временной папке
+        base = txt_file.stem
+        # Ищем исходный .wav в AUDIO_DIR (там же, откуда копировали)
         wav_path = AUDIO_DIR / f"{base}.wav"
         if not wav_path.exists():
-            # может быть в TEMP_INPUT_DIR (симлинк)
-            wav_path = TEMP_INPUT_DIR / f"{base}.wav"
-            if not wav_path.exists():
-                print(f"Предупреждение: не найден исходный аудиофайл для {base}")
-                continue
+            print(f"Предупреждение: не найден исходный аудиофайл для {base}")
+            continue
         size_kb = os.path.getsize(wav_path) // 1024
         with open(txt_file, 'r', encoding='utf-8') as f:
             answer = f.read().strip()
@@ -110,8 +107,13 @@ def main():
         print("Нет подходящих файлов. Выход.")
         return
 
-    print("Шаг 2: Создание симлинков во входную папку Docker...")
-    symlink_files(files, TEMP_INPUT_DIR)
+    print("Шаг 2: Копирование файлов во входную папку Docker...")
+    copy_files(files, TEMP_INPUT_DIR)
+
+    # Очищаем выходную папку, чтобы не накапливались старые результаты
+    if TEMP_OUTPUT_DIR.exists():
+        shutil.rmtree(TEMP_OUTPUT_DIR)
+    TEMP_OUTPUT_DIR.mkdir(parents=True)
 
     print("Шаг 3: Запуск транскрибации...")
     run_docker_transcription()
