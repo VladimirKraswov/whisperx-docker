@@ -30,7 +30,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel && \
     pip install --index-url https://download.pytorch.org/whl/cu128 \
         torch==2.8.0 torchaudio==2.8.0 && \
-    pip install -r /tmp/requirements.ai.txt
+    pip install -r /tmp/requirements.ai.txt && \
+    pip uninstall -y torchcodec || true
 
 # важно для CUDA
 ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+
+# 🔑 отключаем torchcodec полностью
+ENV TORCHCODEC_DISABLE=1

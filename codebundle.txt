@@ -1,7 +1,7 @@
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/whisperx-docker
 ignore: .codebundleignore
-generated: 2026-03-25T17:45:05.167Z
+generated: 2026-03-25T18:16:07.760Z
 
 
 
@@ -406,10 +406,11 @@ ENTRYPOINT ["/app/entrypoint.sh"]
 
 path: /Dockerfile.ai-base
 ----------------------------------------
-FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
+FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
@@ -419,10 +420,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     libsndfile1 \
+    cuda-nvrtc-12-8 \
+    libcublas-12-8 \
+    libcudnn8 \
     && rm -rf /var/lib/apt/lists/*
 
+# venv
 RUN python3 -m venv /venv
 ENV PATH="/venv/bin:$PATH"
+
 ENV PYTHONUNBUFFERED=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 
@@ -431,27 +437,11 @@ COPY requirements.ai.txt /tmp/requirements.ai.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel && \
     pip install --index-url https://download.pytorch.org/whl/cu128 \
-      torch==2.8.0 torchaudio==2.8.0 && \
-    pip install -r /tmp/requirements.ai.txt && \
-    python - <<'PY'
-from pathlib import Path
-import nvidia.cublas.lib
-import nvidia.cudnn.lib
+        torch==2.8.0 torchaudio==2.8.0 && \
+    pip install -r /tmp/requirements.ai.txt
 
-target = Path("/opt/nvidia-python-libs")
-target.mkdir(parents=True, exist_ok=True)
-
-for module in (nvidia.cublas.lib, nvidia.cudnn.lib):
-    src_dir = Path(module.__file__).resolve().parent
-    for lib in src_dir.glob("*.so*"):
-        dst = target / lib.name
-        if not dst.exists():
-            dst.symlink_to(lib)
-
-print(f"Linked runtime CUDA libs to {target}")
-PY
-
-ENV LD_LIBRARY_PATH="/opt/nvidia-python-libs:${LD_LIBRARY_PATH}"
+# важно для CUDA
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
 
 
 path: /entrypoint.sh
@@ -521,7 +511,9 @@ path: /requirements.ai.txt
 ----------------------------------------
 whisperx==3.8.4
 faster-whisper==1.2.1
+transformers==4.57.6
 ctranslate2==4.7.1
+pyannote-audio==4.0.4
 huggingface-hub<1.0.0
 nvidia-cublas-cu12
 nvidia-cudnn-cu12==9.*
@@ -537,6 +529,221 @@ path: /requirements.txt
 ----------------------------------------
 -r requirements.app.txt
 -r requirements.ai.txt
+
+
+path: /scripts/link_all_files.py
+----------------------------------------
+import json
+import os
+
+test_json = '/storage/data/answers_all.json'
+input_dir = '/tmp/whisperx_input'
+
+os.makedirs(input_dir, exist_ok=True)
+
+with open(test_json, 'r') as f:
+    data = json.load(f)
+
+for rec in data:
+    src = rec['file_name']
+    if os.path.exists(src):
+        dst = os.path.join(input_dir, os.path.basename(src))
+        if not os.path.exists(dst):
+            os.symlink(src, dst)
+    else:
+        print(f"Файл не найден: {src}")
+
+print(f"Созданы ссылки для {len(data)} файлов")
+
+
+path: /scripts/link_test_files.py
+----------------------------------------
+import json
+import os
+
+test_json = '/storage/data/test_answers.json'
+input_dir = '/tmp/whisperx_input'
+
+os.makedirs(input_dir, exist_ok=True)
+
+with open(test_json, 'r') as f:
+    data = json.load(f)
+
+for rec in data:
+    src = rec['file_name']
+    if os.path.exists(src):
+        dst = os.path.join(input_dir, os.path.basename(src))
+        if not os.path.exists(dst):
+            os.symlink(src, dst)
+    else:
+        print(f"Файл не найден: {src}")
+
+print(f"Созданы ссылки для {len(data)} файлов")
+
+
+path: /scripts/prepare_all.py
+----------------------------------------
+import json
+import os
+
+unknown_dir = '/storage/data/categorized_by_stack/unknown'
+output_json = '/storage/data/answers_all.json'
+
+files = []
+for f in sorted(os.listdir(unknown_dir)):
+    if not f.endswith('.wav'):
+        continue
+    # Извлекаем user_id из имени файла (первая часть до подчёркивания)
+    parts = f.split('_')
+    if len(parts) >= 2 and parts[0].isdigit():
+        user_id = int(parts[0])
+    else:
+        user_id = None
+    full_path = os.path.join(unknown_dir, f)
+    size_kb = os.path.getsize(full_path) // 1024
+    files.append({
+        "user_id": user_id,
+        "question": "",
+        "quiz_id": None,
+        "size": size_kb,
+        "file_name": full_path,
+        "answer": ""
+    })
+
+print(f"Найдено {len(files)} файлов")
+
+with open(output_json, 'w', encoding='utf-8') as f:
+    json.dump(files, f, ensure_ascii=False, indent=2)
+
+print(f"Создано {len(files)} записей в {output_json}")
+
+
+path: /scripts/prepare_test.py
+----------------------------------------
+import json
+import os
+
+unknown_dir = '/storage/data/categorized_by_stack/unknown'
+audio_answers_json = '/storage/data/audio_answers.json'
+output_json = '/storage/data/test_answers.json'
+
+files = []
+for f in sorted(os.listdir(unknown_dir)):
+    if not f.endswith('.wav'):
+        continue
+    path = os.path.join(unknown_dir, f)
+    if os.path.getsize(path) > 5000:
+        files.append(f)
+        if len(files) == 30:
+            break
+
+print(f"Найдено {len(files)} файлов")
+
+with open(audio_answers_json, 'r', encoding='utf-8') as f:
+    all_records = json.load(f)
+
+index = {}
+for rec in all_records:
+    user = rec.get('user')
+    h = rec.get('hash')
+    if user and h:
+        key = f"{user}_{h}"
+        index[key] = rec
+
+test_records = []
+for f in files:
+    base = os.path.splitext(f)[0]
+    key = base
+    if key in index:
+        rec = index[key]
+        test_records.append({
+            "user_id": rec['user'],
+            "question": rec.get('question_text', ''),
+            "quiz_id": rec.get('quiz_id'),
+            "size": os.path.getsize(os.path.join(unknown_dir, f)) // 1024,
+            "file_name": os.path.join(unknown_dir, f),
+            "answer": ""
+        })
+    else:
+        print(f"Внимание: для файла {f} нет данных в audio_answers.json")
+
+with open(output_json, 'w', encoding='utf-8') as f:
+    json.dump(test_records, f, ensure_ascii=False, indent=2)
+
+print(f"Создано {len(test_records)} записей в {output_json}")
+
+
+path: /scripts/run_test.sh
+----------------------------------------
+#!/bin/bash
+set -e
+
+echo "=== Подготовка тестовых данных ==="
+python3 scripts/prepare_test.py
+
+echo "=== Создание симлинков ==="
+python3 scripts/link_test_files.py
+
+echo "=== Запуск транскрибации (Docker) ==="
+cd "$(dirname "$0")/.."  # переходим в корень проекта
+docker compose run --rm -v /tmp/whisperx_input:/input -v /tmp/whisperx_output:/output whisperx
+
+echo "=== Обновление JSON ==="
+python3 scripts/update_test_json.py
+
+echo "=== Готово. Результат в /storage/data/test_answers.json ==="
+
+
+path: /scripts/update_all_json.py
+----------------------------------------
+import json
+import os
+
+test_json = '/storage/data/answers_all.json'
+output_dir = '/tmp/whisperx_output'
+
+with open(test_json, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+
+for rec in data:
+    base = os.path.splitext(os.path.basename(rec['file_name']))[0]
+    txt_path = os.path.join(output_dir, base + '.txt')
+    if os.path.exists(txt_path):
+        with open(txt_path, 'r', encoding='utf-8') as tf:
+            rec['answer'] = tf.read().strip()
+    else:
+        print(f"Не найден txt для {base}")
+
+with open(test_json, 'w', encoding='utf-8') as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+
+print("JSON обновлён")
+
+
+path: /scripts/update_test_json.py
+----------------------------------------
+import json
+import os
+
+test_json = '/storage/data/test_answers.json'
+output_dir = '/tmp/whisperx_output'
+
+with open(test_json, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+
+for rec in data:
+    base = os.path.splitext(os.path.basename(rec['file_name']))[0]
+    txt_path = os.path.join(output_dir, base + '.txt')
+    if os.path.exists(txt_path):
+        with open(txt_path, 'r', encoding='utf-8') as tf:
+            rec['answer'] = tf.read().strip()
+    else:
+        print(f"Не найден txt для {base}")
+
+with open(test_json, 'w', encoding='utf-8') as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+
+print("JSON обновлён")
 
 
 path: /transcribe_folder.py
@@ -941,8 +1148,8 @@ if __name__ == "__main__":
 
 
 === SUMMARY ===
-included: 15
+included: 22
 skipped(binary): 0
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 28269
+totalBytes(approx): 33439
