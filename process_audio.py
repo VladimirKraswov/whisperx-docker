@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-Пакетная транскрибация аудиофайлов (.wav) длительностью >5 секунд с помощью WhisperX в Docker.
-Результат сохраняется в JSON-файл с полями: user_id, question (из answers_full.json),
-quiz_id (из answers_full.json), size (КБ), file_name, answer (транскрипция).
+Пакетная транскрибация аудиофайлов (.wav) с помощью WhisperX в Docker.
+Фильтрация по размеру файла (минимальный размер задаётся через --min-size).
+Результат сохраняется в JSON с вопросами из answers_full.json.
 """
 
 import argparse
@@ -16,19 +16,19 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 # ----------------------------- Конфигурация по умолчанию -----------------------------
 DEFAULT_AUDIO_DIR = Path("/storage/data/audio")
 DEFAULT_ANSWERS_JSON = Path("/storage/data/answers_full.json")
 DEFAULT_OUTPUT_JSON = Path("/storage/data/output.json")
-DEFAULT_DURATION_THRESHOLD = 5.0          # секунды
+DEFAULT_MIN_SIZE_BYTES = 10000          # 10 КБ – минимальный размер файла для обработки
 DEFAULT_MAX_FILES = 30
 DEFAULT_WHISPERX_IMAGE = "whisperx-docker:latest"
 DEFAULT_MODEL = os.getenv("WHISPERX_MODEL", "small")   # на CPU small работает быстрее
-DEFAULT_LANGUAGE = "ru"                   # язык аудио (можно изменить)
+DEFAULT_LANGUAGE = "ru"                   # язык аудио
 
-# Настройка логирования (вывод в консоль и в файл)
+# Настройка логирования
 LOG_FILE = Path("/tmp/whisperx_process.log")
 logging.basicConfig(
     level=logging.INFO,
@@ -77,10 +77,10 @@ def parse_args() -> argparse.Namespace:
         help=f"Максимальное количество файлов для обработки (по умолчанию: {DEFAULT_MAX_FILES})"
     )
     parser.add_argument(
-        "--min-duration",
-        type=float,
-        default=DEFAULT_DURATION_THRESHOLD,
-        help=f"Минимальная длительность файла в секундах (по умолчанию: {DEFAULT_DURATION_THRESHOLD})"
+        "--min-size",
+        type=int,
+        default=DEFAULT_MIN_SIZE_BYTES,
+        help=f"Минимальный размер файла в байтах для обработки (по умолчанию: {DEFAULT_MIN_SIZE_BYTES})"
     )
     parser.add_argument(
         "--language",
@@ -102,56 +102,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def check_ffprobe() -> bool:
-    """Проверка наличия ffprobe в системе."""
-    try:
-        subprocess.run(["ffprobe", "-version"], capture_output=True, check=True)
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        log.warning("ffprobe не найден. Фильтрация по длительности отключена.")
-        return False
+def find_audio_files(audio_dir: Path, min_size_bytes: int, max_files: int) -> List[Path]:
+    """
+    Возвращает список файлов .wav, размер которых >= min_size_bytes.
+    Останавливается, как только набрано max_files файлов.
+    """
+    if not audio_dir.exists():
+        log.error(f"Директория {audio_dir} не существует.")
+        return []
 
-
-def get_duration_ffprobe(filepath: Path) -> float:
-    """Получение длительности через ffprobe."""
-    result = subprocess.run(
-        [
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", str(filepath)
-        ],
-        capture_output=True,
-        text=True,
-        check=True
-    )
-    return float(result.stdout.strip())
-
-
-def get_duration(filepath: Path) -> float:
-    """Возвращает длительность файла в секундах (0 при ошибке)."""
-    if check_ffprobe():
-        try:
-            return get_duration_ffprobe(filepath)
-        except Exception as e:
-            log.error(f"Ошибка ffprobe для {filepath.name}: {e}")
-            return 0.0
-    # Если ffprobe нет, считаем все файлы подходящими
-    return float("inf")
-
-
-def find_audio_files(audio_dir: Path, min_duration: float, max_files: int) -> List[Path]:
-    """Возвращает список файлов .wav длительностью > min_duration (первые max_files)."""
     wav_files = sorted(audio_dir.glob("*.wav"))
     log.info(f"Найдено {len(wav_files)} .wav файлов в {audio_dir}")
 
     valid = []
     for f in wav_files:
-        duration = get_duration(f)
-        if duration > min_duration:
+        size = f.stat().st_size
+        if size >= min_size_bytes:
             valid.append(f)
-            log.debug(f"{f.name}: {duration:.2f} сек")
+            log.debug(f"{f.name}: {size} байт")
             if len(valid) >= max_files:
                 break
-    log.info(f"Отобрано {len(valid)} файлов (первые {max_files} длительностью > {min_duration} сек)")
+    log.info(f"Отобрано {len(valid)} файлов (первые {max_files} с размером >= {min_size_bytes} байт)")
     return valid
 
 
@@ -273,8 +244,8 @@ def main() -> None:
     # 2. Загрузка индекса вопросов
     answers_index = load_answers_index(args.answers_json)
 
-    # 3. Поиск аудиофайлов
-    audio_files = find_audio_files(args.input_dir, args.min_duration, args.max_files)
+    # 3. Поиск аудиофайлов по размеру
+    audio_files = find_audio_files(args.input_dir, args.min_size, args.max_files)
     if not audio_files:
         log.warning("Нет подходящих файлов. Выход.")
         return
