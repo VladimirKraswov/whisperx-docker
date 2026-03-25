@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -12,9 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     libsndfile1 \
-    cuda-nvrtc-12-8 \
-    libcublas-12-8 \
-    libcudnn8 \
+    cuda-nvrtc-12-4 \
+    libcublas-12-4 \
+    libcudnn9-cuda-12 \
     && rm -rf /var/lib/apt/lists/*
 
 # venv
@@ -28,8 +28,8 @@ COPY requirements.ai.txt /tmp/requirements.ai.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel && \
-    pip install --index-url https://download.pytorch.org/whl/cu128 \
-        torch==2.8.0 torchaudio==2.8.0 && \
+    pip install --index-url https://download.pytorch.org/whl/cu124 \
+        torch==2.4.1 torchaudio==2.4.1 && \
     pip install -r /tmp/requirements.ai.txt && \
     pip uninstall -y torchcodec || true
 
