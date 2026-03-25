@@ -25,8 +25,3 @@
 - `docker-compose.yml` — готовый запуск с папками `./input` и `./output`
 
 ## Первый запуск
-
-Собери AI-базу:
-
-```bash
-docker compose build whisperx-base
