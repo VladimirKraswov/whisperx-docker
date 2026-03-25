@@ -1,7 +1,7 @@
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/whisperx-docker
 ignore: .codebundleignore
-generated: 2026-03-25T18:16:07.760Z
+generated: 2026-03-25T18:41:19.755Z
 
 
 
@@ -438,10 +438,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel && \
     pip install --index-url https://download.pytorch.org/whl/cu128 \
         torch==2.8.0 torchaudio==2.8.0 && \
-    pip install -r /tmp/requirements.ai.txt
+    pip install -r /tmp/requirements.ai.txt && \
+    pip uninstall -y torchcodec || true
 
 # важно для CUDA
 ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+
+# 🔑 отключаем torchcodec полностью
+ENV TORCHCODEC_DISABLE=1
 
 
 path: /entrypoint.sh
@@ -1152,4 +1156,4 @@ included: 22
 skipped(binary): 0
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 33439
+totalBytes(approx): 33566
