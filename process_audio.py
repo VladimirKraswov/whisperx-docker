@@ -4,15 +4,19 @@ import os
 import subprocess
 import sys
 import shutil
+import time
 from pathlib import Path
 
 AUDIO_DIR = Path("/storage/data/audio")
 OUTPUT_JSON = Path("/storage/data/output.json")
-TEMP_INPUT_DIR = Path("/tmp/whisperx_input")
-TEMP_OUTPUT_DIR = Path("/tmp/whisperx_output")
 DURATION_THRESHOLD = 5.0
 MAX_FILES = 30
 WHISPERX_IMAGE = "whisperx-docker:latest"
+
+# Создаём временные папки с уникальным именем
+timestamp = int(time.time())
+TEMP_INPUT_DIR = Path(f"/tmp/whisperx_input_{timestamp}")
+TEMP_OUTPUT_DIR = Path(f"/tmp/whisperx_output_{timestamp}")
 
 def check_ffprobe():
     try:
@@ -60,7 +64,7 @@ def copy_files(files, target_dir):
     target_dir.mkdir(parents=True)
     for f in files:
         dest = target_dir / f.name
-        shutil.copy2(f, dest)  # копируем, сохраняя метаданные
+        shutil.copy2(f, dest)
 
 def run_docker_transcription():
     print("Запуск транскрибации через Docker (это может занять время)...")
@@ -81,7 +85,6 @@ def build_json_from_transcriptions():
     records = []
     for txt_file in TEMP_OUTPUT_DIR.glob("*.txt"):
         base = txt_file.stem
-        # Ищем исходный .wav в AUDIO_DIR (там же, откуда копировали)
         wav_path = AUDIO_DIR / f"{base}.wav"
         if not wav_path.exists():
             print(f"Предупреждение: не найден исходный аудиофайл для {base}")
@@ -99,6 +102,17 @@ def build_json_from_transcriptions():
         })
     return records
 
+def cleanup():
+    # Удаляем временные папки после работы
+    try:
+        shutil.rmtree(TEMP_INPUT_DIR)
+    except Exception as e:
+        print(f"Не удалось удалить {TEMP_INPUT_DIR}: {e}")
+    try:
+        shutil.rmtree(TEMP_OUTPUT_DIR)
+    except Exception as e:
+        print(f"Не удалось удалить {TEMP_OUTPUT_DIR}: {e}")
+
 def main():
     print("Шаг 1: Поиск аудиофайлов длительностью >5 секунд...")
     files = find_audio_files()
@@ -110,11 +124,6 @@ def main():
     print("Шаг 2: Копирование файлов во входную папку Docker...")
     copy_files(files, TEMP_INPUT_DIR)
 
-    # Очищаем выходную папку, чтобы не накапливались старые результаты
-    if TEMP_OUTPUT_DIR.exists():
-        shutil.rmtree(TEMP_OUTPUT_DIR)
-    TEMP_OUTPUT_DIR.mkdir(parents=True)
-
     print("Шаг 3: Запуск транскрибации...")
     run_docker_transcription()
 
@@ -122,6 +131,7 @@ def main():
     records = build_json_from_transcriptions()
     if not records:
         print("Не удалось сформировать записи. Выход.")
+        cleanup()
         return
 
     print(f"Шаг 5: Сохранение в {OUTPUT_JSON}")
@@ -130,6 +140,7 @@ def main():
         json.dump(records, f, ensure_ascii=False, indent=2)
 
     print(f"Готово. Обработано {len(records)} файлов.")
+    cleanup()
 
 if __name__ == "__main__":
     main()
