@@ -151,12 +151,11 @@ def process_batch():
     logger.info(f"Created temporary directories: {temp_input_dir}, {temp_output_dir}")
 
     try:
-        # 5. Создаём симлинки на выбранные файлы
+        # 5. Копируем выбранные файлы во временную папку (вместо симлинков)
         for f in batch:
-            link_path = Path(temp_input_dir) / f.name
-            if not link_path.exists():
-                os.symlink(f, link_path)
-                logger.debug(f"Symlink: {link_path} -> {f}")
+            dest = Path(temp_input_dir) / f.name
+            shutil.copy2(f, dest)
+            logger.debug(f"Copied {f.name} to {dest}")
 
         # 6. Запускаем Docker
         log_filename = f"whisperx_docker_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
