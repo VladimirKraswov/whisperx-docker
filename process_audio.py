@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -102,7 +103,7 @@ def process_batch():
         logger.error(f"Answers JSON not found at {answers_json_path}. Cannot proceed.")
         sys.exit(1)
 
-    # 2. Проверяем каждый файл из индекса: существует ли он, подходит по размеру
+    # 2. Определяем список файлов для обработки (те, что есть в индексе и подходят по размеру)
     audio_extensions = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus"}
     found_files = []
     for audio_path in sorted(answers_index.keys()):
@@ -130,12 +131,14 @@ def process_batch():
     logger.info(f"Created temporary directories: {temp_input_dir}, {temp_output_dir}")
 
     try:
-        # 4. Копирование файлов
+        # 4. Создание симлинков на выбранные файлы
         for f in found_files:
-            logger.info(f"Copying {f.name} to temporary directory...")
-            shutil.copy2(f, Path(temp_input_dir) / f.name)
+            link_path = Path(temp_input_dir) / f.name
+            if not link_path.exists():
+                os.symlink(f, link_path)
+                logger.debug(f"Symlink created: {link_path} -> {f}")
 
-        # 5. Запуск Docker
+        # 5. Запуск Docker в фоне
         log_filename = f"whisperx_docker_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         logger.info(f"Starting Docker container. Logs will be saved to {log_filename}")
 
@@ -170,57 +173,107 @@ def process_batch():
             docker_cmd.extend(["--device", args.device])
 
         with open(log_filename, "w", encoding="utf-8") as log_file:
-            process = subprocess.Popen(
+            docker_process = subprocess.Popen(
                 docker_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True
             )
-            for line in process.stdout:
-                log_file.write(line)
-                log_file.flush()
-                print(line.strip(), flush=True)
 
-            process.wait()
+            # Словарь уже обработанных файлов (чтобы не дублировать)
+            processed = set()
+            # Загружаем существующий output.json, если есть, чтобы не потерять ранее сохранённые записи
+            existing_records = []
+            if output_json_path.exists():
+                try:
+                    with open(output_json_path, "r", encoding="utf-8") as f:
+                        existing_records = json.load(f)
+                    logger.info(f"Loaded {len(existing_records)} existing records from {output_json_path}")
+                except Exception:
+                    pass
 
-        if process.returncode != 0:
-            logger.error(f"Docker container exited with error code {process.returncode}")
-            # Продолжаем, чтобы собрать хотя бы частичные результаты
+            # Множество уже сохранённых имён файлов
+            saved_files = {rec["file_name"] for rec in existing_records}
+
+            # Цикл мониторинга
+            while docker_process.poll() is None:
+                # Проверяем новые .txt файлы
+                for txt_file in Path(temp_output_dir).glob("*.txt"):
+                    if txt_file.name in processed:
+                        continue
+                    processed.add(txt_file.name)
+                    audio_name = txt_file.stem
+                    orig_file = next((f for f in found_files if f.stem == audio_name), None)
+                    if not orig_file:
+                        logger.warning(f"Original file for {txt_file.name} not found, skipping.")
+                        continue
+                    # Проверяем, не сохранён ли уже этот файл (на случай дублирования)
+                    if str(orig_file) in saved_files:
+                        logger.debug(f"File {orig_file.name} already in output, skipping.")
+                        continue
+
+                    with open(txt_file, "r", encoding="utf-8") as f:
+                        answer = f.read().strip()
+
+                    meta = answers_index.get(orig_file.resolve(), {})
+                    record = {
+                        "user_id": extract_user_id(orig_file.name),
+                        "question": meta.get("question", ""),
+                        "quiz_id": meta.get("quiz_id", None),
+                        "size": int(orig_file.stat().st_size / 1024),
+                        "file_name": str(orig_file),
+                        "answer": answer
+                    }
+                    existing_records.append(record)
+                    saved_files.add(str(orig_file))
+
+                    # Сразу записываем обновлённый JSON
+                    with open(output_json_path, "w", encoding="utf-8") as f:
+                        json.dump(existing_records, f, ensure_ascii=False, indent=2)
+                    logger.info(f"Added record for {orig_file.name} to {output_json_path}")
+
+                    # Опционально: удаляем .txt файл, чтобы не накапливать
+                    # txt_file.unlink()
+
+                time.sleep(1)
+
+            # Дожидаемся завершения Docker
+            docker_process.wait()
+
+        if docker_process.returncode != 0:
+            logger.error(f"Docker container exited with error code {docker_process.returncode}")
         else:
             logger.info("Docker transcription completed successfully")
 
-        # 6. Сбор результатов и объединение с метаданными
-        final_records = []
+        # Финальная проверка на случай, если какие-то файлы появились после выхода из цикла
         for txt_file in Path(temp_output_dir).glob("*.txt"):
+            if txt_file.name in processed:
+                continue
+            processed.add(txt_file.name)
             audio_name = txt_file.stem
             orig_file = next((f for f in found_files if f.stem == audio_name), None)
             if not orig_file:
-                logger.warning(f"Original file for {txt_file.name} not found, skipping.")
                 continue
-
+            if str(orig_file) in saved_files:
+                continue
             with open(txt_file, "r", encoding="utf-8") as f:
-                answer_text = f.read().strip()
-
+                answer = f.read().strip()
             meta = answers_index.get(orig_file.resolve(), {})
-            question = meta.get("question", "")
-            quiz_id = meta.get("quiz_id", None)
-
-            final_records.append({
+            record = {
                 "user_id": extract_user_id(orig_file.name),
-                "question": question,
-                "quiz_id": quiz_id,
+                "question": meta.get("question", ""),
+                "quiz_id": meta.get("quiz_id", None),
                 "size": int(orig_file.stat().st_size / 1024),
                 "file_name": str(orig_file),
-                "answer": answer_text
-            })
-
-        if final_records:
-            logger.info(f"Saving {len(final_records)} records to {output_json_path}")
-            output_json_path.parent.mkdir(parents=True, exist_ok=True)
+                "answer": answer
+            }
+            existing_records.append(record)
+            saved_files.add(str(orig_file))
             with open(output_json_path, "w", encoding="utf-8") as f:
-                json.dump(final_records, f, ensure_ascii=False, indent=2)
-        else:
-            logger.warning("No transcription results found to save.")
+                json.dump(existing_records, f, ensure_ascii=False, indent=2)
+            logger.info(f"Added final record for {orig_file.name}")
+
+        logger.info(f"Total records in {output_json_path}: {len(existing_records)}")
 
     finally:
         if not args.keep_temp:
